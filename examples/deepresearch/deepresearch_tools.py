@@ -561,10 +561,10 @@ class ScoreTool(DeepResearchTool):
             },
         )
 
-    async def call(self, competition_id: str, path: str | None = None, **kwargs) -> str:
+    async def call(self, competition_id: str, path: str | None = None, run_dir: str | Path | None = None, **kwargs) -> str:
         """Run mlebench grader and return metrics as a JSON string."""
         # Locate submission
-        output_dir = Path(os.environ.get("DEEPRESEARCH_OUTPUT_DIR", Path.cwd()))
+        output_dir = Path(run_dir) if run_dir else Path(os.environ.get("DEEPRESEARCH_OUTPUT_DIR", Path.cwd()))
         submission_path = Path(path) if path else output_dir / "submission.csv"
         if not submission_path.exists():
             return f"[Error] submission file not found at {submission_path}"
@@ -640,9 +640,9 @@ class PythonInterpreterTool(DeepResearchTool):
                 "required": ["code"],
             },
         )
-        self.timeout = 1800
+        self.timeout = 3600
 
-    async def call(self, code: str, timeout: int = None, **kwargs) -> str:
+    async def call(self, code: str, timeout: int = None, run_dir: str | Path | None = None, **kwargs) -> str:
         """
         Execute Python code by writing it to main.py and launching via srun.
         Captures stdout/stderr to both memory and a log file under the per-run output dir.
@@ -650,7 +650,7 @@ class PythonInterpreterTool(DeepResearchTool):
         timeout = timeout or self.timeout
 
         # Resolve run directory under DEEPRESEARCH_OUTPUT_DIR so outputs align with submission/logs
-        run_dir = Path(os.environ.get("DEEPRESEARCH_OUTPUT_DIR", Path.cwd()))
+        run_dir = Path(run_dir) if run_dir else Path(os.environ.get("DEEPRESEARCH_OUTPUT_DIR", Path.cwd()))
         run_dir.mkdir(parents=True, exist_ok=True)
 
         # Use timestamped filenames to avoid collisions while keeping them in the same folder

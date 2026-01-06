@@ -259,9 +259,13 @@ class DeepResearchWorkflow(Workflow):
             task: New task dictionary
             uid: New unique identifier
         """
-        # Skip parent reset since we don't use registered agents
-        # The DeepResearch agent manages its own state per run()
-        pass
+        # Keep base class bookkeeping so uid/task exist for error handling
+        try:
+            super().reset(task=task, uid=uid)
+        except Exception:
+            # Fallback assignment if parent reset changes in future
+            self.task = task
+            self.uid = uid
 
     def is_multithread_safe(self) -> bool:
         """

@@ -64,6 +64,22 @@ def today_date():
     return datetime.now().date().strftime("%Y-%m-%d")
 
 
+def extract_competition_id_from_prompt(prompt: str) -> str:
+    """
+    Extract competition id from prompt text.
+    Expected pattern: '## Competition ID: <id>'.
+    """
+    comp_id = "unknown_competition"
+    for line in prompt.splitlines():
+        if "## Competition ID:" in line:
+            comp_id = line.split("## Competition ID:", 1)[1].strip() or comp_id
+            break
+
+    comp_id = comp_id.replace(" ", "_")
+    comp_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in comp_id)
+    return comp_id or "unknown_competition"
+
+
 class _Tee:
     """Simple tee to duplicate stdout/stderr to a log file."""
 
@@ -145,6 +161,8 @@ class MultiTurnReactAgent:
         self.tools = tools or {}
         self.system_prompt = system_prompt
         self.use_native_function_calling = use_native_function_calling
+        # Remember the original base output directory once to avoid nesting across tasks
+        self.base_output_dir = Path(os.environ.get("DEEPRESEARCH_OUTPUT_DIR", Path.cwd())).resolve()
 
         # Convert tools to OpenAI format if using native function calling
         if use_native_function_calling and self.tools:
@@ -154,7 +172,7 @@ class MultiTurnReactAgent:
 
         # Configuration from original DeepResearch
         self.max_llm_calls = MAX_LLM_CALL_PER_RUN
-        self.max_time = 150 * 60  # 150 minutes timeout
+        self.max_time = 24 * 60 * 60  # 24 hours timeout
 
         # Smart context management using actual API consumption
         self.total_prompt_tokens = 0
@@ -163,30 +181,43 @@ class MultiTurnReactAgent:
         # Auto-detect context limit based on model capabilities
         # This ensures we don't hit limits too early for capable models
         self.max_context_tokens = self._get_model_context_limit(rollout_engine)
-        self._setup_logging()
 
-    def _setup_logging(self):
+    def _setup_logging(self, output_dir: Path):
         """
-        Tee stdout/stderr to a timestamped output directory (set in custom_evaluate).
-        Uses DEEPRESEARCH_OUTPUT_DIR env var and only initializes once per process.
+        Tee stdout/stderr to the given output directory.
+        Supports reconfiguration per prompt by swapping the log file.
         """
-        if getattr(MultiTurnReactAgent, "_logging_initialized", False):
-            return
-
-        output_dir = Path(os.environ.get("DEEPRESEARCH_OUTPUT_DIR", Path.cwd()))
         output_dir.mkdir(parents=True, exist_ok=True)
         log_path = output_dir / "trajectory.log"
 
-        # Preserve original streams
-        self._orig_stdout = sys.stdout
-        self._orig_stderr = sys.stderr
+        # Preserve original streams once
+        if not hasattr(self, "_orig_stdout"):
+            self._orig_stdout = sys.stdout
+            self._orig_stderr = sys.stderr
+
+        # If already logging to this path and file is open, keep it to avoid races in parallel runs
+        if getattr(self, "_current_log_path", None) == log_path and hasattr(self, "_log_file") and not self._log_file.closed:
+            return
+
+        # Open (do not close previous to avoid breaking other tasks still using the same tee)
+        self._log_file = open(log_path, "a", encoding="utf-8")
 
         # Redirect to tee so prints are saved and still visible
-        sys.stdout = _Tee(sys.stdout, open(log_path, "a", encoding="utf-8"))
-        sys.stderr = _Tee(sys.stderr, open(log_path, "a", encoding="utf-8"))
+        sys.stdout = _Tee(self._orig_stdout, self._log_file)
+        sys.stderr = _Tee(self._orig_stderr, self._log_file)
 
         print(f"[DeepResearch] Logging stdout/stderr to {log_path}")
-        MultiTurnReactAgent._logging_initialized = True
+        self._current_log_path = log_path
+
+    def _prepare_run_directory(self, question: str) -> Path:
+        """
+        Create/ensure a competition-specific subfolder under the base output directory.
+        """
+        base_dir = getattr(self, "base_output_dir", Path(os.environ.get("DEEPRESEARCH_OUTPUT_DIR", Path.cwd())))
+        comp_id = extract_competition_id_from_prompt(question)
+        run_dir = base_dir / comp_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
 
     def _get_model_context_limit(self, rollout_engine) -> int:
         """
@@ -395,6 +426,11 @@ class MultiTurnReactAgent:
             Dictionary with results including messages, prediction, and termination reason
         """
         start_time = time.time()
+
+        # Prepare competition-specific output directory and logging
+        run_dir = self._prepare_run_directory(question)
+        self.current_run_dir = run_dir
+        self._setup_logging(run_dir)
 
         # Setup system prompt with current date
         system_prompt = self.system_prompt + today_date()
@@ -731,10 +767,15 @@ class MultiTurnReactAgent:
                 # Call the tool
                 if hasattr(self.tools[tool_name], "call"):
                     # Async tool
+                    call_kwargs = dict(tool_args)
+                    # Pass run_dir hint for tools that accept it (PythonInterpreter, Score)
+                    if getattr(self, "current_run_dir", None) is not None:
+                        call_kwargs.setdefault("run_dir", self.current_run_dir)
+
                     if asyncio.iscoroutinefunction(self.tools[tool_name].call):
-                        result = await self.tools[tool_name].call(**tool_args)
+                        result = await self.tools[tool_name].call(**call_kwargs)
                     else:
-                        result = self.tools[tool_name].call(**tool_args)
+                        result = self.tools[tool_name].call(**call_kwargs)
                 elif callable(self.tools[tool_name]):
                     # Direct callable
                     result = self.tools[tool_name](**tool_args)
@@ -765,9 +806,9 @@ class MultiTurnReactAgent:
                 tool = self.tools["PythonInterpreter"]
                 if hasattr(tool, "call"):
                     if asyncio.iscoroutinefunction(tool.call):
-                        result = await tool.call(code=code)
+                        result = await tool.call(code=code, run_dir=getattr(self, "current_run_dir", None))
                     else:
-                        result = tool.call(code=code)
+                        result = tool.call(code=code, run_dir=getattr(self, "current_run_dir", None))
                     return str(result)
                 else:
                     return "PythonInterpreter tool is not callable"

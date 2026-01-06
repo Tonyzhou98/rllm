@@ -7,7 +7,6 @@ from deepresearch_workflow import DeepResearchWorkflow
 from deepresearch_tools import PythonInterpreterTool, ScoreTool
 from rllm.engine.rollout import OpenAIEngine
 
-
 SYSTEM_PROMPT = """You are an expert Kaggle competitor. Produce one Python script that trains a model and writes `submission.csv` for the dataset in the user prompt.
 
 Rules:
@@ -36,70 +35,19 @@ Code inside those tags runs in Python; keep the tool name `python` and include <
 
 - To grade the submission.csv file, you need to use Score tool and output json object like this:
 <tool_call>
-{"name": "Score", "arguments": {"competition_id": "spaceship-titanic"}}
+{"name": "Score", "arguments": {"competition_id": "competition id here, such as aerial-cactus-identification, which can be found in the task description"}}
 </tool_call>
 
 Current date: """
 
-task_specific_prompt = """
-## Competition ID: spaceship-titanic
+task_specific_prompt = """## Description
 
-## Description
-Welcome to the year 2912, where your data science skills are needed to solve a cosmic mystery. We've received a transmission from four lightyears away and things aren't looking good.
+## Competition ID: {id}
 
-The *Spaceship Titanic* was an interstellar passenger liner launched a month ago. With almost 13,000 passengers on board, the vessel set out on its maiden voyage transporting emigrants from our solar system to three newly habitable exoplanets orbiting nearby stars.
-
-While rounding Alpha Centauri en route to its first destination—the torrid 55 Cancri E—the unwary *Spaceship Titanic* collided with a spacetime anomaly hidden within a dust cloud. Sadly, it met a similar fate as its namesake from 1000 years before. Though the ship stayed intact, almost half of the passengers were transported to an alternate dimension!
-
-![joel-filipe-QwoNAhbmLLo-unsplash.jpg](https://storage.googleapis.com/kaggle-media/competitions/Spaceship%20Titanic/joel-filipe-QwoNAhbmLLo-unsplash.jpg)
-
-To help rescue crews and retrieve the lost passengers, you are challenged to predict which passengers were transported by the anomaly using records recovered from the spaceship’s damaged computer system.
-
-Help save them and change history!
-
-## Evaluation
-
-### Metric
-
-Submissions are evaluated based on their [classification accuracy](https://developers.google.com/machine-learning/crash-course/classification/accuracy), the percentage of predicted labels that are correct.
-
-### Submission Format
-
-The submission format for the competition is a csv file with the following format:
-
-```
-PassengerId,Transported
-0013_01,False
-0018_01,False
-0019_01,False
-0021_01,False
-etc.
-```
-
-# Dataset Description
-
-In this competition your task is to predict whether a passenger was transported to an alternate dimension during the Spaceship Titanic's collision with the spacetime anomaly. To help you make these predictions, you're given a set of personal records recovered from the ship's damaged computer system.
-
-## File and Data Field Descriptions
-
-- **train.csv** - Personal records for about two-thirds (~8700) of the passengers, to be used as training data.
-    - `PassengerId` - A unique Id for each passenger. Each Id takes the form `gggg_pp` where `gggg` indicates a group the passenger is travelling with and `pp` is their number within the group. People in a group are often family members, but not always.
-    - `HomePlanet` - The planet the passenger departed from, typically their planet of permanent residence.
-    - `CryoSleep` - Indicates whether the passenger elected to be put into suspended animation for the duration of the voyage. Passengers in cryosleep are confined to their cabins.
-    - `Cabin` - The cabin number where the passenger is staying. Takes the form `deck/num/side`, where `side` can be either `P` for *Port* or `S` for *Starboard*.
-    - `Destination` - The planet the passenger will be debarking to.
-    - `Age` - The age of the passenger.
-    - `VIP` - Whether the passenger has paid for special VIP service during the voyage.
-    - `RoomService`, `FoodCourt`, `ShoppingMall`, `Spa`, `VRDeck` - Amount the passenger has billed at each of the *Spaceship Titanic*'s many luxury amenities.
-    - `Name` - The first and last names of the passenger.
-    - `Transported` - Whether the passenger was transported to another dimension. This is the target, the column you are trying to predict.
-- **test.csv** - Personal records for the remaining one-third (~4300) of the passengers, to be used as test data. Your task is to predict the value of `Transported` for the passengers in this set.
-- **sample_submission.csv** - A submission file in the correct format.
-    - `PassengerId` - Id for each passenger in the test set.
-    - `Transported` - The target. For each passenger, predict either `True` or `False`.
+{task_description}
 
 ## Dataset Folder:
-/fsx/zyhang/mle-bench-data/spaceship-titanic/prepared/public/
+/fsx/zyhang/mle-bench-data/{id}/prepared/public/
 """
 
 user_prompt_template = """
@@ -108,7 +56,9 @@ You are solving the task below. Follow the requirements precisely.
 {specific_task_description}
 
 Your code should adhere to the following requirements:
-- Prefer and explicitly use GPU (CUDA) acceleration when available: move models/tensors to GPU and handle CPU fallback if CUDA is not present.
+- Prefer and explicitly use GPU (CUDA) acceleration when available (one A100 GPU should be available): move models/tensors to GPU and handle CPU fallback if CUDA is not present.
+- Each PythonInterpreter execution must finish within 1 hour (hard limit). 
+- Overall runtime limits: the agent may take up to 100 turns, and the total program time budget (total tool calling + token generation) is 24 hours.
 - Load train/test data from the provided dataset folder (## Dataset Folder).
 - Match the exact columns/headers in sample_submission.csv (## Dataset Folder) and write submission.csv to the **current directory**.
 - Use only common preinstalled libraries (no installs).
@@ -116,6 +66,19 @@ Your code should adhere to the following requirements:
 - The task is an out-of-date competition, so please ignore the timeline in the task description.
 """
 
+
+def load_task_description(competition_id: str) -> str:
+    """Read description.md for a competition and return its content."""
+    competition_path = Path(f"/fsx/zyhang/mle-bench-data/{competition_id}/prepared/public/")
+    if not competition_path.exists():
+        raise FileNotFoundError(f"Competition data path does not exist: {competition_path}")
+
+    print(f"Using competition data path: {competition_path}")
+    description_file = competition_path / "description.md"
+    if not description_file.exists():
+        raise FileNotFoundError(f"description.md not found for competition: {competition_id}")
+
+    return description_file.read_text().strip()
 
 
 # Setup rollout engine
@@ -138,13 +101,42 @@ workflow_engine = AgentWorkflowEngine(
         "system_prompt": SYSTEM_PROMPT,
     },
     rollout_engine=engine,
-    n_parallel_tasks=1  # Run 1 task in parallel
+    n_parallel_tasks=5  # Run 5 tasks in parallel
 )
 
 # Run evaluation on multiple tasks
-tasks = [
-    {"question": user_prompt_template.replace("{specific_task_description}", task_specific_prompt), "answer": "submission"},
-]
+competition_id_list = [
+    "aerial-cactus-identification",
+    "aptos2019-blindness-detection",
+    "denoising-dirty-documents",
+    "detecting-insults-in-social-commentary",
+    "dog-breed-identification",
+    "dogs-vs-cats-redux-kernels-edition",
+    "histopathologic-cancer-detection",
+    "jigsaw-toxic-comment-classification-challenge",
+    "leaf-classification",
+    "mlsp-2013-birds",
+    "new-york-city-taxi-fare-prediction",
+    "nomad2018-predict-transparent-conductors",
+    "plant-pathology-2020-fgvc7",
+    "random-acts-of-pizza",
+    "ranzcr-clip-catheter-line-classification",
+    "siim-isic-melanoma-classification",
+    "spooky-author-identification",
+    "tabular-playground-series-dec-2021",
+    "tabular-playground-series-may-2022",
+    "text-normalization-challenge-english-language",
+    "text-normalization-challenge-russian-language",
+    "the-icml-2013-whale-challenge-right-whale-redux",
+]  # Hardcoded competition ids to run
+
+tasks = []
+for competition_id in competition_id_list:
+    specific_task_description = load_task_description(competition_id)
+    specific_prompt = task_specific_prompt.replace("{id}", competition_id).replace("{task_description}", specific_task_description)
+    tasks.append(
+        {"question": user_prompt_template.replace("{specific_task_description}", specific_prompt), "answer": "submission"}
+    )
 
 
 def setup_output_directory() -> Path:
