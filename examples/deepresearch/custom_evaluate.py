@@ -1,11 +1,14 @@
-import os
+import argparse
 import asyncio
+import os
 from datetime import datetime
 from pathlib import Path
+
 from rllm.engine.agent_workflow_engine import AgentWorkflowEngine
-from deepresearch_workflow import DeepResearchWorkflow
-from deepresearch_tools import PythonInterpreterTool, ScoreTool
 from rllm.engine.rollout import OpenAIEngine
+
+from deepresearch_tools import PythonInterpreterTool, ScoreTool
+from deepresearch_workflow import DeepResearchWorkflow
 
 SYSTEM_PROMPT = """You are an expert Kaggle competitor. Produce one Python script that trains a model and writes `submission.csv` for the dataset in the user prompt.
 
@@ -57,14 +60,44 @@ You are solving the task below. Follow the requirements precisely.
 
 Your code should adhere to the following requirements:
 - Prefer and explicitly use GPU (CUDA) acceleration when available (one A100 GPU should be available): move models/tensors to GPU and handle CPU fallback if CUDA is not present.
-- Each PythonInterpreter execution must finish within 1 hour (hard limit). 
-- Overall runtime limits: the agent may take up to 100 turns, and the total program time budget (total tool calling + token generation) is 24 hours.
-- Load train/test data from the provided dataset folder (## Dataset Folder).
+- Each PythonInterpreter execution must finish within 5 mins (hard limit). 
+- Overall runtime limits: the agent may take up to 30 turns, and the total program time budget (total tool calling + token generation) is 24 hours.
+- Load train/test data from the provided dataset folder (## Dataset Folder). Please first check the data files and their formats (file types, column names, row counts, etc.).
 - Match the exact columns/headers in sample_submission.csv (## Dataset Folder) and write submission.csv to the **current directory**.
 - Use only common preinstalled libraries (no installs).
+- DO NOT display progress bars due to the context window limit. If you have to use function integrated with progress bars, disable progress bars or use the appropriate parameter to silence them.
 - Please restrict the use of external libraries to the common libraries.
 - The task is an out-of-date competition, so please ignore the timeline in the task description.
 """
+
+# competition_id_list = [
+#     "aerial-cactus-identification",
+#     "aptos2019-blindness-detection",
+#     "denoising-dirty-documents",
+#     "detecting-insults-in-social-commentary",
+#     "dog-breed-identification",
+#     "dogs-vs-cats-redux-kernels-edition",
+#     "histopathologic-cancer-detection",
+#     "jigsaw-toxic-comment-classification-challenge",
+#     "leaf-classification",
+#     "mlsp-2013-birds",
+#     "new-york-city-taxi-fare-prediction",
+#     "nomad2018-predict-transparent-conductors",
+#     "plant-pathology-2020-fgvc7",
+#     "random-acts-of-pizza",
+#     "ranzcr-clip-catheter-line-classification",
+#     "siim-isic-melanoma-classification",
+#     "spooky-author-identification",
+#     "tabular-playground-series-dec-2021",
+#     "tabular-playground-series-may-2022",
+#     "text-normalization-challenge-english-language",
+#     "text-normalization-challenge-russian-language",
+#     "the-icml-2013-whale-challenge-right-whale-redux",
+# ]  # Hardcoded competition ids to run
+
+
+# competition_id_list = ["spaceship-titanic"]
+competition_id_list = ["spaceship-titanic", "spooky-author-identification"]
 
 
 def load_task_description(competition_id: str) -> str:
@@ -81,73 +114,32 @@ def load_task_description(competition_id: str) -> str:
     return description_file.read_text().strip()
 
 
-# Setup rollout engine
-engine = OpenAIEngine(
-    model="anthropic/claude-sonnet-4.5",
-    api_key=os.environ.get("OPENROUTER_API_KEY"),
-    base_url="https://openrouter.ai/api/v1"
-)
-
-# Create workflow engine for parallel execution
-workflow_engine = AgentWorkflowEngine(
-    workflow_cls=DeepResearchWorkflow,
-    workflow_args={
-        "tools": {
-            "PythonInterpreter": PythonInterpreterTool(),
-            "Score": ScoreTool(),
-        },
-        "max_prompt_length": 4096,
-        "max_response_length": 2048,
-        "system_prompt": SYSTEM_PROMPT,
-    },
-    rollout_engine=engine,
-    n_parallel_tasks=5  # Run 5 tasks in parallel
-)
-
-# Run evaluation on multiple tasks
-competition_id_list = [
-    "aerial-cactus-identification",
-    "aptos2019-blindness-detection",
-    "denoising-dirty-documents",
-    "detecting-insults-in-social-commentary",
-    "dog-breed-identification",
-    "dogs-vs-cats-redux-kernels-edition",
-    "histopathologic-cancer-detection",
-    "jigsaw-toxic-comment-classification-challenge",
-    "leaf-classification",
-    "mlsp-2013-birds",
-    "new-york-city-taxi-fare-prediction",
-    "nomad2018-predict-transparent-conductors",
-    "plant-pathology-2020-fgvc7",
-    "random-acts-of-pizza",
-    "ranzcr-clip-catheter-line-classification",
-    "siim-isic-melanoma-classification",
-    "spooky-author-identification",
-    "tabular-playground-series-dec-2021",
-    "tabular-playground-series-may-2022",
-    "text-normalization-challenge-english-language",
-    "text-normalization-challenge-russian-language",
-    "the-icml-2013-whale-challenge-right-whale-redux",
-]  # Hardcoded competition ids to run
-
-tasks = []
-for competition_id in competition_id_list:
-    specific_task_description = load_task_description(competition_id)
-    specific_prompt = task_specific_prompt.replace("{id}", competition_id).replace("{task_description}", specific_task_description)
-    tasks.append(
-        {"question": user_prompt_template.replace("{specific_task_description}", specific_prompt), "answer": "submission"}
-    )
+def build_tasks(competition_ids: list[str]) -> list[dict]:
+    """Build user prompts/tasks for the provided competition ids."""
+    tasks = []
+    for competition_id in competition_ids:
+        specific_task_description = load_task_description(competition_id)
+        specific_prompt = task_specific_prompt.replace("{id}", competition_id).replace("{task_description}", specific_task_description)
+        tasks.append(
+            {"question": user_prompt_template.replace("{specific_task_description}", specific_prompt)}
+        )
+    return tasks
 
 
-def setup_output_directory() -> Path:
+def _slugify(text: str) -> str:
+    """Make a filesystem-friendly slug from model names like provider/model."""
+    return "".join(c if c.isalnum() or c in "-._" else "_" for c in text)
+
+
+def setup_output_directory(model_name: str) -> Path:
     """
-    Create output/<timestamp> under this file's directory and switch cwd there so
+    Create output/<model>-<timestamp> under this file's directory and switch cwd there so
     all generated files (e.g., submission.csv) land inside the run folder.
     """
     base_dir = Path(__file__).resolve().parent
     output_root = base_dir / "output"
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = output_root / timestamp
+    run_dir = output_root / f"{_slugify(model_name)}-{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     os.chdir(run_dir)
     # Let other modules know where to write artifacts/logs
@@ -156,15 +148,64 @@ def setup_output_directory() -> Path:
     return run_dir
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for model selection and runtime configuration."""
+    parser = argparse.ArgumentParser(description="Run DeepResearch custom evaluation over Kaggle tasks.")
+    parser.add_argument(
+        "--model",
+        default="anthropic/claude-sonnet-4.5",
+        help="Base model identifier for OpenRouter (e.g., 'anthropic/claude-sonnet-4.5' or 'qwen3-8b' placeholder).",
+    )
+    parser.add_argument(
+        "--parallel-tasks",
+        type=int,
+        default=5,
+        help="Number of parallel tasks to run.",
+    )
+    return parser.parse_args()
+
+
+def create_rollout_engine(model: str) -> OpenAIEngine:
+    """Helper to create the rollout engine with the desired base model."""
+    resolved_api_key = os.environ.get("OPENROUTER_API_KEY")
+
+    if "claude" in model:
+        return OpenAIEngine(model=model, api_key=resolved_api_key, base_url="https://openrouter.ai/api/v1")
+    elif "qwen" in model:
+        return OpenAIEngine(model="qwen3_8b_serve", api_key="None", base_url="http://h200-058-135:8001/v1")
+    else:
+        raise ValueError(f"Unsupported model specified: {model}")
+
 async def main():
-    setup_output_directory()
+    args = parse_args()
+    setup_output_directory(args.model)
+
+    engine = create_rollout_engine(model=args.model)
+    workflow_engine = AgentWorkflowEngine(
+        workflow_cls=DeepResearchWorkflow,
+        workflow_args={
+            "tools": {
+                "PythonInterpreter": PythonInterpreterTool(),
+                "Score": ScoreTool(),
+            },
+            "max_prompt_length": 4096,
+            "max_response_length": 2048,
+            "system_prompt": SYSTEM_PROMPT,
+        },
+        rollout_engine=engine,
+        n_parallel_tasks=args.parallel_tasks,
+    )
+
+    tasks = build_tasks(competition_id_list)
     episodes = await workflow_engine.execute_tasks(tasks)
 
     # Episodes contain full trajectories for training
     for episode in episodes:
-        print(f"Task: {episode.task}")
-        print(f"Prediction: {episode.metrics.get('prediction')}")
+        # print(f"Task: {episode.task}")
+        # print(f"Prediction: {episode.metrics.get('prediction')}")
         print(f"Is correct: {episode.is_correct}")
+        print(f"Reward: {episode.metrics.get('reward')}")
+        print(f"Reward details: {episode.metrics.get('reward_details')}")
 
 if __name__ == "__main__":
     asyncio.run(main())

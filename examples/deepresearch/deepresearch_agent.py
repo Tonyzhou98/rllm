@@ -22,7 +22,7 @@ from rllm.engine.rollout import RolloutEngine
 # Constants from original DeepResearch
 OBS_START = "<tool_response>"
 OBS_END = "\n</tool_response>"
-MAX_LLM_CALL_PER_RUN = 100
+MAX_LLM_CALL_PER_RUN = 30
 
 # System prompt adapted from DeepResearch
 # DEEPRESEARCH_SYSTEM_PROMPT = """You are a deep research assistant. Your core function is to conduct thorough, multi-source investigations into any topic. You MUST use the provided tools to research and verify information before answering. Do NOT answer directly from memory - always use tools to gather current, accurate information.
@@ -181,6 +181,7 @@ class MultiTurnReactAgent:
         # Auto-detect context limit based on model capabilities
         # This ensures we don't hit limits too early for capable models
         self.max_context_tokens = self._get_model_context_limit(rollout_engine)
+        print(f"   🎯 Using max context length: {self.max_context_tokens:,} tokens")
 
     def _setup_logging(self, output_dir: Path):
         """
@@ -212,10 +213,13 @@ class MultiTurnReactAgent:
     def _prepare_run_directory(self, question: str) -> Path:
         """
         Create/ensure a competition-specific subfolder under the base output directory.
+        To avoid collisions across parallel trajectories for the same competition,
+        create a unique run subfolder per call.
         """
         base_dir = getattr(self, "base_output_dir", Path(os.environ.get("DEEPRESEARCH_OUTPUT_DIR", Path.cwd())))
         comp_id = extract_competition_id_from_prompt(question)
-        run_dir = base_dir / comp_id
+        # Use timestamped subdir to isolate multiple trajectories for the same competition
+        run_dir = base_dir / comp_id / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
 
@@ -225,7 +229,8 @@ class MultiTurnReactAgent:
         Uses LiteLLM's model info when available, falls back to conservative estimates.
         Returns 90% of max to leave safety headroom.
         """
-        model_name = rollout_engine.model
+        # model_name = rollout_engine.model
+        model_name = "qwen3"
 
         # Method 1: Try LiteLLM's get_model_info (most accurate)
         try:
@@ -284,6 +289,7 @@ class MultiTurnReactAgent:
             # Qwen
             ("qwen2", "qwen-2"): 128 * 1024,
             ("qwen",): 32 * 1024,
+            ("qwen3"): 40960,
         }
 
         for patterns, max_tokens in fallback_limits.items():
@@ -326,7 +332,8 @@ class MultiTurnReactAgent:
                 api_params = {"messages": messages}
 
                 # Model-specific parameter configuration
-                model_name = self.rollout_engine.model.lower()
+                # model_name = self.rollout_engine.model.lower()
+                model_name = "qwen3"
 
                 if "o3" in model_name or "o1" in model_name or "gpt-5" in model_name:
                     # O3/O1/GPT-5: Very limited parameter support
@@ -344,17 +351,15 @@ class MultiTurnReactAgent:
                     )
                 elif "qwen" in model_name:
                     # Qwen models
-                    print("🧠 Using Qwen-specific OpenRouter API parameters")
                     api_params.update(
                         {
                             "temperature": 0.6,
                             "top_p": 0.95,
-                            "max_tokens": 4096,
+                            "max_tokens": 8192,
                         }
                     )
                 elif "claude" in model_name:
                     # Claude models
-                    print("🧠 Using Claude-specific OpenRouter API parameters")
                     api_params.update(
                         {
                             "temperature": 0.6,
@@ -367,7 +372,7 @@ class MultiTurnReactAgent:
                     api_params.update(
                         {
                             "temperature": 0.6,
-                            "max_tokens": 4096,
+                            "max_tokens": 8192,
                         }
                     )
 
@@ -397,15 +402,101 @@ class MultiTurnReactAgent:
 
         raise Exception(f"Failed to get response after {max_tries} attempts")
 
-    def get_total_tokens_used(self) -> int:
+    def _estimate_context_tokens(self, messages: list[dict]) -> int:
+        """
+        Roughly estimate tokens for the current message history.
+        Tries tiktoken for the active model; falls back to a character heuristic.
+        """
+        text_chunks = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_chunks.append(str(part.get("text", "")))
+            else:
+                text_chunks.append(str(content))
+
+        full_text = "\n".join(text_chunks)
+
+        try:
+            import tiktoken
+
+            # encoding = tiktoken.encoding_for_model(self.rollout_engine.model)
+            encoding = tiktoken.encoding_for_model("qwen3")
+            return len(encoding.encode(full_text, disallowed_special=()))
+        except Exception:
+            # Heuristic: ~4 chars per token
+            return max(1, len(full_text) // 4)
+
+    def get_total_tokens_used(self, messages: list[dict] | None = None) -> int:
         """
         Get total tokens consumed so far from actual API usage.
-        This is much more accurate than any tokenizer estimation.
+        If messages are provided, return an estimate based on current context
+        (useful after pruning history).
 
         Returns:
             Total tokens used (prompt + completion)
         """
+        if messages is not None:
+            return self._estimate_context_tokens(messages)
         return self.total_prompt_tokens + self.total_completion_tokens
+
+
+    def _prune_failed_tool_turns(self, messages: list[dict]) -> list[dict]:
+        """
+        Remove assistant/tool-response pairs where the tool failed (error in tool output)
+        to reclaim context without losing successful steps.
+        """
+        if len(messages) <= 2:
+            return messages
+
+        pruned = messages[:2]  # preserve system + original user prompt
+        i = 2
+        while i < len(messages):
+            msg = messages[i]
+
+            # ReAct text format: assistant tool_call followed by user tool_response
+            if (
+                isinstance(msg, dict)
+                and msg.get("role") == "assistant"
+                and "<tool_call>" in msg.get("content", "")
+                and i + 1 < len(messages)
+                and isinstance(messages[i + 1], dict)
+                and messages[i + 1].get("role") == "user"
+                and "<tool_response>" in messages[i + 1].get("content", "")
+            ):
+                tool_resp = messages[i + 1].get("content", "")
+                if "error" in tool_resp.lower():
+                    i += 2
+                    continue  # drop failed turn
+                pruned.extend([msg, messages[i + 1]])
+                i += 2
+                continue
+
+            # Native function calling: assistant with tool_calls followed by tool role response(s)
+            if (
+                isinstance(msg, dict)
+                and msg.get("role") == "assistant"
+                and msg.get("tool_calls")
+                and i + 1 < len(messages)
+                and isinstance(messages[i + 1], dict)
+                and messages[i + 1].get("role") == "tool"
+            ):
+                tool_resp = messages[i + 1].get("content", "")
+                if "error" in str(tool_resp).lower():
+                    i += 2
+                    continue  # drop failed turn
+                pruned.extend([msg, messages[i + 1]])
+                i += 2
+                continue
+
+            pruned.append(msg)
+            i += 1
+
+        return pruned
 
     async def _run(self, question: str, answer: str = None, images: list = None, **kwargs) -> dict:
         """
@@ -486,11 +577,17 @@ class MultiTurnReactAgent:
             # Extract text content (may be None for pure function calling)
             content = response.text if hasattr(response, "text") and response.text else ""
 
+            # remove the reasoning part in the content
+            if "<think>" in content and "</think>" in content:
+                start_idx = content.find("<think>")
+                end_idx = content.find("</think>") + len("</think>")
+                content = content[:start_idx] + content[end_idx:]
+
             # Debug: Print raw model response to see format
             if round == 1:
                 print(f"[DEBUG] Raw model response (first 500 chars): {content[:500]}")
-                if hasattr(response, "tool_calls") and response.tool_calls:
-                    print(f"[DEBUG] Native tool_calls detected: {len(response.tool_calls)} call(s)")
+                # if hasattr(response, "tool_calls") and response.tool_calls:
+                #     print(f"[DEBUG] Native tool_calls detected: {len(response.tool_calls)} call(s)")
 
             # Print concise round info with truncation
             MAX_PRINT_LENGTH = 200
@@ -512,7 +609,7 @@ class MultiTurnReactAgent:
             # Print round info based on content type
             if "<tool_call>" in content:
                 # Extract tool name for display
-                if "python" in content.lower() and "<code>" in content:
+                if "python" in content.lower() or "<code>" in content.lower():
                     print(f"Round {round}: 🐍 Executing Python code")
                     print(f"Model response: {content}")
                 elif '"name":' in content:
@@ -532,7 +629,7 @@ class MultiTurnReactAgent:
                         print(f"Error parsing tool call: {e}")
                         print(f"Round {round}: 🔧 Tool call")
                 else:
-                    print(f"Round {round}: 🔧 Tool call")
+                    print(f"Round {round}: 🔧 Tool call, Content snippet: {truncate(content, 100)}")
             elif "<answer>" in content:
                 # Final answer
                 answer_preview = content.split("<answer>")[1].split("</answer>")[0]
@@ -552,83 +649,83 @@ class MultiTurnReactAgent:
 
             # HYBRID MODE: Handle both native tool_calls and ReAct text format
 
-            # Priority 1: Check for native function calling (o3, gpt-4-turbo)
-            if hasattr(response, "tool_calls") and response.tool_calls:
-                # Native function calling path - build ALL messages first, then append atomically
-                tool_calls_formatted = []
-                tool_responses = []
+            # # Priority 1: Check for native function calling (o3, gpt-4-turbo)
+            # if hasattr(response, "tool_calls") and response.tool_calls:
+            #     # Native function calling path - build ALL messages first, then append atomically
+            #     tool_calls_formatted = []
+            #     tool_responses = []
 
-                for tool_call in response.tool_calls:
-                    try:
-                        # Follow strands.py tolerant extraction of function/name/arguments
-                        try:
-                            function = tool_call.get("function", {}) if isinstance(tool_call, dict) else getattr(tool_call, "function", {})
-                        except Exception:
-                            function = tool_call
+            #     for tool_call in response.tool_calls:
+            #         try:
+            #             # Follow strands.py tolerant extraction of function/name/arguments
+            #             try:
+            #                 function = tool_call.get("function", {}) if isinstance(tool_call, dict) else getattr(tool_call, "function", {})
+            #             except Exception:
+            #                 function = tool_call
 
-                        tool_id = tool_call.get("id") if isinstance(tool_call, dict) else getattr(tool_call, "id", "unknown")
-                        tool_name = function.get("name") if isinstance(function, dict) else getattr(function, "name", "")
-                        arguments_raw = function.get("arguments") if isinstance(function, dict) else getattr(function, "arguments", "{}")
+            #             tool_id = tool_call.get("id") if isinstance(tool_call, dict) else getattr(tool_call, "id", "unknown")
+            #             tool_name = function.get("name") if isinstance(function, dict) else getattr(function, "name", "")
+            #             arguments_raw = function.get("arguments") if isinstance(function, dict) else getattr(function, "arguments", "{}")
 
-                        # Parse arguments if provided as JSON string
-                        tool_args = json.loads(arguments_raw) if isinstance(arguments_raw, str) else arguments_raw
+            #             # Parse arguments if provided as JSON string
+            #             tool_args = json.loads(arguments_raw) if isinstance(arguments_raw, str) else arguments_raw
 
-                        # Print tool call with arguments (for consistency with ReAct format)
-                        def truncate(text, max_len=100):
-                            text = str(text).replace("\n", " ").strip()
-                            if len(text) > max_len:
-                                return text[:max_len] + "..."
-                            return text
+            #             # Print tool call with arguments (for consistency with ReAct format)
+            #             def truncate(text, max_len=100):
+            #                 text = str(text).replace("\n", " ").strip()
+            #                 if len(text) > max_len:
+            #                     return text[:max_len] + "..."
+            #                 return text
 
-                        args_str = truncate(str(tool_args), 100)
-                        print(f"Round {round}: 🔧 [Native] Calling {tool_name} with args: {args_str}")
+            #             args_str = truncate(str(tool_args), 100)
+            #             print(f"Round {round}: 🔧 [Native] Calling {tool_name} with args: {args_str}")
 
-                        # Execute tool
-                        result = await self.custom_call_tool(tool_name, tool_args)
+            #             # Execute tool
+            #             result = await self.custom_call_tool(tool_name, tool_args)
 
-                        # Collect tool call and response (don't append yet)
-                        tool_calls_formatted.append(
-                            {
-                                "id": tool_id,
-                                "type": "function",
-                                "function": {
-                                    "name": tool_name,
-                                    "arguments": arguments_raw,
-                                },
-                            }
-                        )
-                        tool_responses.append({"role": "tool", "tool_call_id": tool_id, "content": result})
-                        print(f"Round {round}: 🛠️ [Native] Tool {tool_name} returned: {str(result)}")
+            #             # Collect tool call and response (don't append yet)
+            #             tool_calls_formatted.append(
+            #                 {
+            #                     "id": tool_id,
+            #                     "type": "function",
+            #                     "function": {
+            #                         "name": tool_name,
+            #                         "arguments": arguments_raw,
+            #                     },
+            #                 }
+            #             )
+            #             tool_responses.append({"role": "tool", "tool_call_id": tool_id, "content": result})
+            #             print(f"Round {round}: 🛠️ [Native] Tool {tool_name} returned: {str(result)}")
 
-                    except Exception as e:
-                        print(f"Error processing native tool call: {e}")
-                        # On error, append error message and skip this tool call
-                        messages.append({"role": "assistant", "content": content.strip()})
-                        messages.append({"role": "user", "content": f"Tool call error: {e}"})
-                        continue
+            #         except Exception as e:
+            #             print(f"Error processing native tool call: {e}")
+            #             # On error, append error message and skip this tool call
+            #             messages.append({"role": "assistant", "content": content.strip()})
+            #             messages.append({"role": "user", "content": f"Tool call error: {e}"})
+            #             continue
 
-                # Only append to messages if we have successful tool calls
-                if tool_calls_formatted:
-                    # Add assistant message with ALL tool calls at once
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": content or "",  # May be empty for pure function calling
-                            "tool_calls": tool_calls_formatted,
-                        }
-                    )
-                    # Add all tool responses
-                    messages.extend(tool_responses)
+            #     # Only append to messages if we have successful tool calls
+            #     if tool_calls_formatted:
+            #         # Add assistant message with ALL tool calls at once
+            #         messages.append(
+            #             {
+            #                 "role": "assistant",
+            #                 "content": content or "",  # May be empty for pure function calling
+            #                 "tool_calls": tool_calls_formatted,
+            #             }
+            #         )
+            #         # Add all tool responses
+            #         messages.extend(tool_responses)
 
             # Priority 2: Check for ReAct text format (gpt-4o, Claude)
-            elif "<tool_call>" in content and "</tool_call>" in content:
+            if "<tool_call>" in content and "</tool_call>" in content:
                 # ReAct text format path
                 messages.append({"role": "assistant", "content": content.strip()})
 
                 tool_call_text = content.split("<tool_call>")[1].split("</tool_call>")[0]
                 try:
                     # Special handling for Python code (match original logic)
-                    if "python" in tool_call_text.lower():
+                    if "python" in tool_call_text.lower() or "<code>" in tool_call_text.lower():
                         try:
                             # Extract code from the original content (not just tool_call_text)
                             code_blocks = re.findall(r"<code>(.*?)</code>", content, flags=re.DOTALL | re.IGNORECASE)
@@ -638,7 +735,7 @@ class MultiTurnReactAgent:
                             result = await self.execute_python(merged_code)
                             print(f"Round {round}: 🐍 Python execution result: {result}")
                         except Exception:
-                            result = "[Python Interpreter Error]: Formatting error."
+                            result = "[Python Interpreter Error]: Formatting error. You must wrap your code within <code></code> tags."
                     else:
                         # Parse JSON tool call
                         tool_call = json5.loads(tool_call_text)
@@ -672,10 +769,27 @@ class MultiTurnReactAgent:
                 if isinstance(messages[-1], dict) and "content" in messages[-1]:
                     messages[-1]["content"] = "Sorry, the number of llm calls exceeds the limit."
 
-            # Handle context length limit using actual API consumption
-            # total_tokens_used = self.get_total_tokens_used()
+            # Handle context length limit using current message context
+            total_tokens_used = self.get_total_tokens_used(messages)
 
-            # if total_tokens_used > self.max_context_tokens:
+            if total_tokens_used > self.max_context_tokens:
+                before = len(messages)
+                messages = self._prune_failed_tool_turns(messages)
+                self.total_prompt_tokens = self._estimate_context_tokens(messages)
+                self.total_completion_tokens = 0
+                removed = before - len(messages)
+                if removed > 0:
+                    print(f"Round {round}: 🧹 Pruned {removed} message(s) with failed tool outputs to save context.")
+                    continue  # retry loop with cleaned messages
+
+                # Fallback: keep system, original user, and last few exchanges
+                if len(messages) > 2:
+                    messages = messages[:2] + messages[-2:]
+                    self.total_prompt_tokens = self._estimate_context_tokens(messages)
+                    self.total_completion_tokens = 0
+                    print(f"Round {round}: ⚠️ Context still high; keeping recent history only.")
+                    continue
+
             #     # Instead of replacing the last message, add a clear instruction
             #     final_instruction = {
             #         "role": "user",

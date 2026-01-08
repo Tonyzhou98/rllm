@@ -10,9 +10,10 @@ Now supports both:
 """
 
 import http.client
+import asyncio
 import json
 import os
-import asyncio
+import random
 import subprocess
 from abc import ABC, abstractmethod
 from collections import deque
@@ -624,7 +625,12 @@ class ScoreTool(DeepResearchTool):
 
         # metrics["raw_output_text"] = output
         metrics["submission_path"] = str(submission_path)
-        return json.dumps(metrics)
+
+        # Build human-friendly prefix when score is missing; surface grader output directly
+        if score is None:
+            return f"Submission csv is invalid. Detailed issue: {output}"
+
+        return f"Submission OK. Details: {json.dumps(metrics)}"
 
 
 class PythonInterpreterTool(DeepResearchTool):
@@ -640,7 +646,7 @@ class PythonInterpreterTool(DeepResearchTool):
                 "required": ["code"],
             },
         )
-        self.timeout = 3600
+        self.timeout = 300  # Default timeout in seconds
 
     async def call(self, code: str, timeout: int = None, run_dir: str | Path | None = None, **kwargs) -> str:
         """
@@ -661,19 +667,31 @@ class PythonInterpreterTool(DeepResearchTool):
 
         script_path.write_text(code, encoding="utf-8")
 
-        # Run via srun and activate the requested conda env before executing Python
+        # Run directly within the current allocation; avoid nested srun.
         conda_env = os.environ.get("DEEPRESEARCH_CONDA_ENV", "algoevolve")
-        bash_cmd = f"source ~/miniconda3/bin/activate && conda activate {conda_env} && python -u {script_filename}"
-        cmd = [
-            "srun",
-            "--gres=gpu:1",
-            "--ntasks=1",
-            "--cpus-per-task=64",
-            "--time=2-00:00:00",
-            "bash",
-            "-lc",
-            bash_cmd,
-        ]
+        bash_cmd = f"source ~/miniconda3/bin/activate && conda activate {conda_env} && python -u {script_filename} && conda deactivate && conda activate rllm"
+        cmd = ["bash", "-lc", bash_cmd]
+
+        # Pin each run to a random GPU when none is specified to spread load across 8-GPU node.
+        env = os.environ.copy()
+        if not env.get("CUDA_VISIBLE_DEVICES"):
+            try:
+                gpu_count = int(env.get("DEEPRESEARCH_GPU_COUNT", "8"))
+                env["CUDA_VISIBLE_DEVICES"] = str(random.randrange(gpu_count))
+            except Exception:
+                pass
+
+        # Previous approach using srun (kept for reference):
+        # cmd = [
+        #     "srun",
+        #     "--gres=gpu:1",
+        #     "--ntasks=1",
+        #     "--cpus-per-task=64",
+        #     "--time=2-00:00:00",
+        #     "bash",
+        #     "-lc",
+        #     bash_cmd,
+        # ]
 
         async def _stream_output(stream, log_fp, buf: deque, prefix: str = ""):
             while True:
@@ -683,6 +701,11 @@ class PythonInterpreterTool(DeepResearchTool):
                 text = prefix + line.decode(errors="replace")
                 log_fp.write(text)
                 log_fp.flush()
+                # Stream live to user
+                print(text, end="", flush=True)
+                # Skip progress-bar style carriage-return updates in the returned tail to avoid bloating LLM context.
+                if "\r" in text:
+                    continue
                 buf.append(text)
 
         try:
@@ -691,6 +714,7 @@ class PythonInterpreterTool(DeepResearchTool):
                 cwd=str(run_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
         except FileNotFoundError as e:
             return f"[Error] srun not found: {e}"
@@ -700,6 +724,19 @@ class PythonInterpreterTool(DeepResearchTool):
         stdout_buf = deque(maxlen=200)
         stderr_buf = deque(maxlen=200)
         timed_out = False
+
+        def _truncate_block(text: str, max_lines: int = 20) -> str:
+            """
+            Truncate long text blocks by keeping only the last few lines for the LLM while preserving full logs on disk.
+            """
+            if not text:
+                return text
+            lines = text.splitlines()
+            if len(lines) <= max_lines:
+                return text
+            tail = lines[-max_lines:]
+            truncated = len(lines) - max_lines
+            return "\n".join(tail + [f"...[truncated {truncated} lines, see log for full output]"])
 
         with open(log_path, "w", encoding="utf-8") as log_fp:
             stdout_task = asyncio.create_task(_stream_output(proc.stdout, log_fp, stdout_buf))
@@ -716,6 +753,13 @@ class PythonInterpreterTool(DeepResearchTool):
 
         stdout_tail = "".join(stdout_buf).strip()
         stderr_tail = "".join(stderr_buf).strip()
+        stdout_tail = _truncate_block(stdout_tail)
+
+        # Remove noisy srun launcher lines before truncating
+        if stderr_tail:
+            filtered = [ln for ln in stderr_tail.split("\n") if "srun" not in ln]
+            stderr_tail = "\n".join(filtered)
+            stderr_tail = _truncate_block(stderr_tail)
 
         if timed_out:
             return f"[Timeout] Exceeded {timeout}s. Logs: {log_path}"
@@ -724,11 +768,19 @@ class PythonInterpreterTool(DeepResearchTool):
             err_msg = stderr_tail or f"Process exited with code {returncode}"
             return f"[Error] {err_msg}\nLogs: {log_path}"
 
+        submission_path = run_dir / "submission.csv"
+
         if stdout_tail:
-            return f"[Output]\n{stdout_tail}\nLogs: {log_path}"
+            return f"[Output]\n{stdout_tail}"
         if stderr_tail:
-            return f"[Warning] No stdout. Stderr:\n{stderr_tail}\nLogs: {log_path}"
-        return f"[Success] Completed with no output. Logs: {log_path}"
+            # if no stdout, check if submission.csv was created
+            if submission_path.exists():
+                return f"No stdout, but submission.csv found at {submission_path}. Stderr:\n{stderr_tail}"
+            return f"No stdout and submission.csv not found. Stderr:\n{stderr_tail}"
+
+        if submission_path.exists():
+            return f"No stdout, but submission.csv found at {submission_path}."
+        return f"No stdout and submission.csv not found."
 
 
 # Tool registry

@@ -6,7 +6,14 @@ enabling parallel execution and trajectory tracking while maintaining DeepResear
 core reasoning capabilities.
 """
 
-from deepresearch_agent import MultiTurnReactAgent
+import json
+
+try:
+    # When imported as a package (python -m examples.deepresearch.custom_train)
+    from .deepresearch_agent import MultiTurnReactAgent
+except ImportError:
+    # Fallback for direct script execution
+    from deepresearch_agent import MultiTurnReactAgent
 
 from rllm.agents.agent import Action, Episode, Step, Trajectory
 from rllm.engine.rollout import RolloutEngine
@@ -48,15 +55,15 @@ class DeepResearchWorkflow(Workflow):
 
         # Auto-detect if we should use native function calling
         # O3 models require native function calling, other models use XML format
-        model_name = rollout_engine.model.lower()
-        use_native_fc = "o3" in model_name or "o1" in model_name
+        # model_name = rollout_engine.model.lower()
+        # use_native_fc = "o3" in model_name or "o1" in model_name
 
         # Create the DeepResearch agent
         self.agent = MultiTurnReactAgent(
             rollout_engine=rollout_engine,
             tools=self.tools,
             system_prompt=self.system_prompt,
-            use_native_function_calling=use_native_fc,
+            use_native_function_calling=False,
         )
 
         # Note: We don't register the agent since DeepResearch handles its own trajectory
@@ -110,6 +117,88 @@ class DeepResearchWorkflow(Workflow):
             episode.metrics = {"error": str(e)}
             return episode
 
+    def _extract_score_metrics(self, messages: list[dict]) -> dict:
+        """
+        Find the latest ScoreTool output (handles both ReAct <tool_response> and native tool roles).
+        """
+        for msg in reversed(messages):
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content", "")
+
+            # Native tool_call path: role == "tool" with raw JSON string
+            if msg.get("role") == "tool" and isinstance(content, str):
+                try:
+                    content = content.split("Details: ", 1)[1]
+                    parsed = json.loads(content.strip())
+                    if isinstance(parsed, dict) and "score_primary (main competition metric for current code)" in parsed:
+                        return parsed
+                except Exception:
+                    pass
+
+            # ReAct path: user message with <tool_response> wrapper
+            if isinstance(content, str) and "<tool_response>" in content:
+                try:
+                    payload = content.split("<tool_response>", 1)[1].split("</tool_response>", 1)[0]
+                    payload = payload.split("Details: ", 1)[1]
+                    parsed = json.loads(payload.strip())
+                    if isinstance(parsed, dict) and "score_primary (main competition metric for current code)" in parsed:
+                        return parsed
+                except Exception:
+                    continue
+
+        return {}
+
+    def _count_errors(self, trajectory: Trajectory) -> tuple[int, float]:
+        """Count observations that look like errors/timeouts and return (count, rate)."""
+        err_markers = ("[error", "error:", "timeout", "[timeout", "failed", "exception")
+        count = 0
+        for step in trajectory.steps:
+            obs = step.observation or ""
+            if not isinstance(obs, str):
+                continue
+            low = obs.lower()
+            if any(marker in low for marker in err_markers):
+                count += 1
+        total_steps = max(1, len(trajectory.steps))
+        return count, count / total_steps
+
+    def _score_to_reward(self, metrics: dict, error_count: int, error_rate: float, message_count: int) -> tuple[float, dict]:
+        """
+        Convert ScoreTool metrics into a scalar reward.
+        - Uses score_primary and metric_lower_is_better.
+        - Applies a small penalty per observed error and conversation length to encourage clean, short runs.
+        Returns (reward, extra_metrics).
+        """
+        reward = 0.0
+        score = metrics.get("score_primary (main competition metric for current code)")
+        lower_is_better = metrics.get("metric_lower_is_better") or metrics.get("metric_lower_is_better (true means lower score is better)")
+
+        if score is not None:
+            try:
+                score_val = float(score)
+                reward = -score_val if lower_is_better else score_val
+            except Exception:
+                reward = 0.0
+
+        # Light penalties for noisy/long runs
+        reward -= 0.02 * error_rate  # scaled by rate
+        reward -= 0.005 * message_count  # discourage excessive turns
+
+        # Clamp to keep extremes bounded
+        reward = max(min(reward, 1e3), -1e3)
+
+        extra = {
+            "reward_raw": reward,
+            "score_primary": score,
+            "metric_lower_is_better": lower_is_better,
+            "metric_lower_is_better (true means lower score is better)": lower_is_better,
+            "error_count": error_count,
+            "error_rate": error_rate,
+            "message_count": message_count,
+        }
+        return reward, extra
+
     def _convert_to_episode(self, result: dict, task: dict, uid: str) -> Episode:
         """
         Convert DeepResearch result to rLLM Episode format.
@@ -150,8 +239,14 @@ class DeepResearchWorkflow(Workflow):
 
         # Determine if the answer is correct (if ground truth available)
         prediction = result.get("prediction", "")
-        ground_truth = task.get("answer", "")
-        is_correct = self._evaluate_answer(prediction, ground_truth) if ground_truth else False
+        score_metrics = self._extract_score_metrics(messages)
+
+        error_count, error_rate = self._count_errors(trajectory)
+        message_count = len(messages)
+        reward_value, reward_details = self._score_to_reward(score_metrics, error_count, error_rate, message_count)
+
+        # For our Kaggle-style tasks, correctness is tied to reward from ScoreTool
+        is_correct = reward_value > 0
 
         # Map termination reason
         termination_reason = self._map_termination_reason(result.get("termination", "unknown"))
@@ -163,13 +258,16 @@ class DeepResearchWorkflow(Workflow):
         episode.termination_reason = termination_reason
         episode.is_correct = is_correct
         trajectory.name = "deepresearch_agent"
-        trajectory.reward = 1.0 if is_correct else 0.0
+        trajectory.reward = reward_value
         episode.trajectories = [trajectory]
         episode.metrics = {
             "rounds": result.get("rounds", 0),
             "time_taken": result.get("time_taken", 0),
-            "prediction": prediction,
-            "ground_truth": ground_truth,
+            # "prediction": prediction,
+            # "score_metrics": score_metrics,
+            "reward": reward_value,
+            "error_count": error_count,
+            # "reward_details": reward_details,
         }
 
         return episode
