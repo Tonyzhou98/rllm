@@ -5,7 +5,7 @@ from pathlib import Path
 import hydra
 from rllm.trainer.agent_trainer import AgentTrainer
 from rllm.data.dataset import DatasetRegistry
-from .deepresearch_tools import PythonInterpreterTool, ScoreTool
+from .deepresearch_tools import PythonInterpreterTool, ScoreTool, SynScoreTool
 from .deepresearch_workflow import DeepResearchWorkflow
 
 SYSTEM_PROMPT = """You are an expert Kaggle competitor. Produce one Python script that trains a model and writes `submission.csv` for the dataset in the user prompt.
@@ -41,6 +41,8 @@ Code inside those tags runs in Python; keep the tool name `python` and include <
 
 Current date: """
 
+SYNTHETIC_DATA = True
+
 
 def setup_output_directory() -> Path:
     """
@@ -60,15 +62,17 @@ def setup_output_directory() -> Path:
 @hydra.main(config_path="pkg://rllm.trainer.config", config_name="agent_ppo_trainer", version_base=None)
 def main(config):
     setup_output_directory()
+    dataset_name = "mle_bench_syn" if SYNTHETIC_DATA else "mle_bench"
+    score_tool = SynScoreTool() if SYNTHETIC_DATA else ScoreTool()
     # Create trainer with your workflow
-    train_dataset = DatasetRegistry.load_dataset("mle_bench", "train")
-    test_dataset = DatasetRegistry.load_dataset("mle_bench", "test")
+    train_dataset = DatasetRegistry.load_dataset(dataset_name, "train")
+    test_dataset = DatasetRegistry.load_dataset(dataset_name, "test")
     trainer = AgentTrainer(
         workflow_class=DeepResearchWorkflow,
         workflow_args={
             "tools": {
                 "PythonInterpreter": PythonInterpreterTool(),
-                "Score": ScoreTool(),
+                "Score": score_tool,
             },
             "system_prompt": SYSTEM_PROMPT,
         },

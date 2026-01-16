@@ -633,6 +633,109 @@ class ScoreTool(DeepResearchTool):
         return f"Submission OK. Details: {json.dumps(metrics)}"
 
 
+class SynScoreTool(DeepResearchTool):
+    """Evaluate submission.csv with a local evaluator.py for synthetic datasets."""
+
+    def __init__(self):
+        super().__init__(
+            name="SynScore",
+            description="Grade submission.csv using evaluator.py in the output directory",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Optional path to submission.csv; defaults to DEEPRESEARCH_OUTPUT_DIR/submission.csv",
+                    }
+                },
+                "required": [],
+            },
+        )
+
+    async def call(self, competition_id: str, path: str | None = None, run_dir: str | Path | None = None, **kwargs) -> str:
+        """Run evaluator.py from the output directory and return metrics as a JSON string."""
+        output_dir = Path(run_dir) if run_dir else Path(os.environ.get("DEEPRESEARCH_OUTPUT_DIR", Path.cwd()))
+        submission_path = Path(path) if path else output_dir / "submission.csv"
+        evaluator_path = Path("/fsx/zyhang/mle-bench-syn") / competition_id / "prepared" / "public" / "evaluator.py"
+        evaluator_dir = evaluator_path.parent
+
+        if submission_path != output_dir / "submission.csv":
+            return f"[Error] submission.csv must be located at {output_dir / 'submission.csv'}"
+        if not evaluator_path.exists():
+            return f"[Error] evaluator.py not found at {evaluator_path}"
+        if not submission_path.exists():
+            return f"[Error] submission file not found at {submission_path}"
+
+        cmd = ["python", "evaluator.py", "--submission_path", str(submission_path)]
+
+        try:
+            eval_proc = await asyncio.create_task(
+                asyncio.to_thread(
+                    subprocess.run,
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    cwd=evaluator_dir,
+                )
+            )
+        except FileNotFoundError as e:
+            return f"[Error] python not found: {e}"
+        except Exception as e:
+            return f"[Error] Failed to start evaluator: {e}"
+
+        stdout = (eval_proc.stdout or "").strip()
+        stderr = (eval_proc.stderr or "").strip()
+
+        if eval_proc.returncode != 0:
+            output = "\n".join([line for line in [stderr, stdout] if line])
+            return f"[Error] Evaluation failed with code {eval_proc.returncode}: {output}"
+
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError as e:
+            output = "\n".join([line for line in [stderr, stdout] if line])
+            return f"[Error] Failed to parse evaluator output as JSON: {e}. Output: {output}"
+
+        metrics = {}
+
+        def parse_number(key: str):
+            value = data.get(key)
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except Exception:
+                return None
+
+        def parse_bool(value):
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return value != 0
+            if isinstance(value, str):
+                return value.strip().lower() in {"true", "1", "yes"}
+            return None
+
+        score = parse_number("score")
+        metrics["score_primary (main competition metric for current code)"] = score
+
+        is_lower_better = parse_bool(data.get("is_lower_better"))
+        if is_lower_better is not None:
+            metrics["metric_lower_is_better (true means lower score is better)"] = is_lower_better
+
+        metrics["threshold_gold (score needed for gold tier)"] = parse_number("gold_threshold")
+        metrics["threshold_silver (score needed for silver tier)"] = parse_number("silver_threshold")
+        metrics["threshold_bronze (score needed for bronze tier)"] = parse_number("bronze_threshold")
+        metrics["threshold_median (median submission score)"] = parse_number("median_threshold")
+        metrics["submission_path"] = str(submission_path)
+
+        if score is None:
+            output = "\n".join([line for line in [stderr, stdout] if line])
+            return f"Submission csv is invalid. Detailed issue: {output}"
+
+        return f"Submission OK. Details: {json.dumps(metrics)}"
+
+
 class PythonInterpreterTool(DeepResearchTool):
     """Safe Python code execution (from existing implementation)."""
 
@@ -650,7 +753,7 @@ class PythonInterpreterTool(DeepResearchTool):
 
     async def call(self, code: str, timeout: int = None, run_dir: str | Path | None = None, **kwargs) -> str:
         """
-        Execute Python code by writing it to main.py and launching via srun.
+        Execute Python code by writing it to main.py and launching via python or srun.
         Captures stdout/stderr to both memory and a log file under the per-run output dir.
         """
         timeout = timeout or self.timeout
@@ -667,10 +770,33 @@ class PythonInterpreterTool(DeepResearchTool):
 
         script_path.write_text(code, encoding="utf-8")
 
-        # Run directly within the current allocation; avoid nested srun.
         conda_env = os.environ.get("DEEPRESEARCH_CONDA_ENV", "algoevolve")
         bash_cmd = f"source ~/miniconda3/bin/activate && conda activate {conda_env} && python -u {script_filename} && conda deactivate && conda activate rllm"
-        cmd = ["bash", "-lc", bash_cmd]
+        use_srun = False
+        try:
+            gpu_check = subprocess.run(
+                ["nvidia-smi"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            use_srun = gpu_check.returncode != 0
+        except FileNotFoundError:
+            use_srun = True
+
+        if use_srun:
+            cmd = [
+                "srun",
+                "--gres=gpu:1",
+                "--ntasks=1",
+                "--cpus-per-task=64",
+                "--time=2-00:00:00",
+                "bash",
+                "-lc",
+                bash_cmd,
+            ]
+        else:
+            cmd = ["bash", "-lc", bash_cmd]
 
         # Pin each run to a random GPU when none is specified to spread load across 8-GPU node.
         env = os.environ.copy()
@@ -680,18 +806,6 @@ class PythonInterpreterTool(DeepResearchTool):
                 env["CUDA_VISIBLE_DEVICES"] = str(random.randrange(gpu_count))
             except Exception:
                 pass
-
-        # Previous approach using srun (kept for reference):
-        # cmd = [
-        #     "srun",
-        #     "--gres=gpu:1",
-        #     "--ntasks=1",
-        #     "--cpus-per-task=64",
-        #     "--time=2-00:00:00",
-        #     "bash",
-        #     "-lc",
-        #     bash_cmd,
-        # ]
 
         async def _stream_output(stream, log_fp, buf: deque, prefix: str = ""):
             while True:
@@ -717,9 +831,11 @@ class PythonInterpreterTool(DeepResearchTool):
                 env=env,
             )
         except FileNotFoundError as e:
-            return f"[Error] srun not found: {e}"
+            missing = "srun" if use_srun else "bash"
+            return f"[Error] {missing} not found: {e}"
         except Exception as e:
-            return f"[Error] Failed to start srun: {e}"
+            launcher = "srun" if use_srun else "bash"
+            return f"[Error] Failed to start {launcher}: {e}"
 
         stdout_buf = deque(maxlen=200)
         stderr_buf = deque(maxlen=200)
@@ -756,7 +872,7 @@ class PythonInterpreterTool(DeepResearchTool):
         stdout_tail = _truncate_block(stdout_tail)
 
         # Remove noisy srun launcher lines before truncating
-        if stderr_tail:
+        if stderr_tail and use_srun:
             filtered = [ln for ln in stderr_tail.split("\n") if "srun" not in ln]
             stderr_tail = "\n".join(filtered)
             stderr_tail = _truncate_block(stderr_tail)
@@ -790,6 +906,7 @@ DEEPRESEARCH_TOOLS = {
     "Visit": VisitTool(),
     "FileParser": FileParserTool(),
     "Score": ScoreTool(),
+    "SynScore": SynScoreTool(),
     "PythonInterpreter": PythonInterpreterTool(),
 }
 

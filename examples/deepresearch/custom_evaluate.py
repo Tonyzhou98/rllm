@@ -7,7 +7,7 @@ from pathlib import Path
 from rllm.engine.agent_workflow_engine import AgentWorkflowEngine
 from rllm.engine.rollout import OpenAIEngine
 
-from deepresearch_tools import PythonInterpreterTool, ScoreTool
+from deepresearch_tools import PythonInterpreterTool, ScoreTool, SynScoreTool
 from deepresearch_workflow import DeepResearchWorkflow
 
 SYSTEM_PROMPT = """You are an expert Kaggle competitor. Produce one Python script that trains a model and writes `submission.csv` for the dataset in the user prompt.
@@ -50,7 +50,7 @@ task_specific_prompt = """## Description
 {task_description}
 
 ## Dataset Folder:
-/fsx/zyhang/mle-bench-data/{id}/prepared/public/
+{data_root}/{id}/prepared/public/
 """
 
 user_prompt_template = """
@@ -60,7 +60,7 @@ You are solving the task below. Follow the requirements precisely.
 
 Your code should adhere to the following requirements:
 - Prefer and explicitly use GPU (CUDA) acceleration when available (one A100 GPU should be available): move models/tensors to GPU and handle CPU fallback if CUDA is not present.
-- Each PythonInterpreter execution must finish within 5 mins (hard limit). 
+- Each Python interpreter execution must finish within 5 mins (hard limit), so please do not use cross-validation or long training loops.
 - Overall runtime limits: the agent may take up to 30 turns, and the total program time budget (total tool calling + token generation) is 24 hours.
 - Load train/test data from the provided dataset folder (## Dataset Folder). Please first check the data files and their formats (file types, column names, row counts, etc.).
 - Match the exact columns/headers in sample_submission.csv (## Dataset Folder) and write submission.csv to the **current directory**.
@@ -97,12 +97,14 @@ Your code should adhere to the following requirements:
 
 
 # competition_id_list = ["spaceship-titanic"]
-competition_id_list = ["spaceship-titanic", "spooky-author-identification"]
+# competition_id_list = ["spaceship-titanic", "spooky-author-identification"]
+
+competition_id_list = ["multi-organ-thoracic-cancer-detection-from-low-dose-chest-ct-volumes"]
 
 
-def load_task_description(competition_id: str) -> str:
+def load_task_description(competition_id: str, data_root: Path) -> str:
     """Read description.md for a competition and return its content."""
-    competition_path = Path(f"/fsx/zyhang/mle-bench-data/{competition_id}/prepared/public/")
+    competition_path = data_root / competition_id / "prepared" / "public"
     if not competition_path.exists():
         raise FileNotFoundError(f"Competition data path does not exist: {competition_path}")
 
@@ -114,12 +116,16 @@ def load_task_description(competition_id: str) -> str:
     return description_file.read_text().strip()
 
 
-def build_tasks(competition_ids: list[str]) -> list[dict]:
+def build_tasks(competition_ids: list[str], data_root: Path) -> list[dict]:
     """Build user prompts/tasks for the provided competition ids."""
     tasks = []
     for competition_id in competition_ids:
-        specific_task_description = load_task_description(competition_id)
-        specific_prompt = task_specific_prompt.replace("{id}", competition_id).replace("{task_description}", specific_task_description)
+        specific_task_description = load_task_description(competition_id, data_root)
+        specific_prompt = (
+            task_specific_prompt.replace("{id}", competition_id)
+            .replace("{task_description}", specific_task_description)
+            .replace("{data_root}", str(data_root))
+        )
         tasks.append(
             {"question": user_prompt_template.replace("{specific_task_description}", specific_prompt)}
         )
@@ -162,6 +168,12 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="Number of parallel tasks to run.",
     )
+    parser.add_argument(
+        "--synthetic",
+        action="store_true",
+        default=False,
+        help="Use synthetic dataset from /fsx/zyhang/mle-bench-syn and SynScoreTool.",
+    )
     return parser.parse_args()
 
 
@@ -172,21 +184,24 @@ def create_rollout_engine(model: str) -> OpenAIEngine:
     if "claude" in model:
         return OpenAIEngine(model=model, api_key=resolved_api_key, base_url="https://openrouter.ai/api/v1")
     elif "qwen" in model:
-        return OpenAIEngine(model="qwen3_8b_serve", api_key="None", base_url="http://h200-058-135:8001/v1")
+        return OpenAIEngine(model="qwen3_8b_serve", api_key="None", base_url="http://h200-060-102:8001/v1")
     else:
         raise ValueError(f"Unsupported model specified: {model}")
 
 async def main():
     args = parse_args()
     setup_output_directory(args.model)
+    data_root = Path("/fsx/zyhang/mle-bench-syn" if args.synthetic else "/fsx/zyhang/mle-bench-data")
+    print("Data root:", data_root)
 
     engine = create_rollout_engine(model=args.model)
+    score_tool = SynScoreTool() if args.synthetic else ScoreTool()
     workflow_engine = AgentWorkflowEngine(
         workflow_cls=DeepResearchWorkflow,
         workflow_args={
             "tools": {
                 "PythonInterpreter": PythonInterpreterTool(),
-                "Score": ScoreTool(),
+                "Score": score_tool,
             },
             "max_prompt_length": 4096,
             "max_response_length": 2048,
@@ -196,7 +211,7 @@ async def main():
         n_parallel_tasks=args.parallel_tasks,
     )
 
-    tasks = build_tasks(competition_id_list)
+    tasks = build_tasks(competition_id_list, data_root)
     episodes = await workflow_engine.execute_tasks(tasks)
 
     # Episodes contain full trajectories for training

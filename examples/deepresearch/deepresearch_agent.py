@@ -343,7 +343,7 @@ class MultiTurnReactAgent:
                     api_params.update(
                         {
                             "stop": ["\n<tool_response>", "<tool_response>"],
-                            "temperature": 0.6,
+                            "temperature": 1.0,
                             "top_p": 0.95,
                             "max_tokens": 4096,
                             "presence_penalty": 1.1,
@@ -353,7 +353,7 @@ class MultiTurnReactAgent:
                     # Qwen models
                     api_params.update(
                         {
-                            "temperature": 0.6,
+                            "temperature": 1.0,
                             "top_p": 0.95,
                             "max_tokens": 8192,
                         }
@@ -362,7 +362,7 @@ class MultiTurnReactAgent:
                     # Claude models
                     api_params.update(
                         {
-                            "temperature": 0.6,
+                            "temperature": 1.0,
                             "top_p": 0.95,
                             "max_tokens": 8192,
                         }
@@ -371,7 +371,7 @@ class MultiTurnReactAgent:
                     # Fallback: Conservative params
                     api_params.update(
                         {
-                            "temperature": 0.6,
+                            "temperature": 1.0,
                             "max_tokens": 8192,
                         }
                     )
@@ -754,6 +754,8 @@ class MultiTurnReactAgent:
 
             # Priority 3: No tool call, just reasoning or answer
             else:
+                if "<answer>" in content and "</answer>" in content:
+                    content += f"\n<output>{self.current_run_dir}</output>"  # Ensure output tag for final answer
                 messages.append({"role": "assistant", "content": content.strip()})
 
             # Check for final answer AFTER processing tools

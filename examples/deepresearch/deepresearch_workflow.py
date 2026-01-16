@@ -7,6 +7,8 @@ core reasoning capabilities.
 """
 
 import json
+import os
+import re
 
 try:
     # When imported as a package (python -m examples.deepresearch.custom_train)
@@ -96,8 +98,16 @@ class DeepResearchWorkflow(Workflow):
             # Run the DeepResearch agent
             result = await self.agent.run(question=question, answer=answer, **kwargs)
 
+            messages = result.get("messages", [])
+            # score_metrics = self._extract_score_metrics(messages)
+            # if not score_metrics:
+            #     print("⚠️  No ScoreTool output found in conversation, running ScoreTool fallback...")
+            #     score_metrics = await self._maybe_run_score_tool(question, messages)
+
+            score_metrics = await self._maybe_run_score_tool(question, messages)
+            print(f"   Score metrics: {score_metrics}")
             # Convert the result to rLLM Episode format
-            episode = self._convert_to_episode(result, task, uid)
+            episode = self._convert_to_episode(result, task, uid, score_metrics=score_metrics)
 
             print(f"✅ DeepResearch workflow completed for task {uid}")
             print(f"   Prediction: {result.get('prediction', 'No prediction')}")
@@ -149,6 +159,46 @@ class DeepResearchWorkflow(Workflow):
 
         return {}
 
+    async def _maybe_run_score_tool(self, question: str, messages) -> dict:
+        """
+        If no ScoreTool output is present, run the Score tool to capture metrics.
+        """
+        score_tool = self.tools.get("Score")
+        if score_tool is None:
+            return {}
+
+        competition_id = self._extract_competition_id(question)
+        if not competition_id:
+            return {}
+
+        try:
+            run_dir = None
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content", "")
+                if isinstance(content, str) and "<output>" in content and "</output>" in content and "<answer>" in content and "</answer>" in content:
+                    run_dir = content.split("<output>", 1)[1].split("</output>", 1)[0].strip()
+                    print(f"Find output directory for ScoreTool fallback: {run_dir}")
+                    break
+            if run_dir is None:
+                print("⚠️  No output directory found in conversation for ScoreTool fallback.")
+                return {}
+            result = await score_tool.call(competition_id=competition_id, run_dir=run_dir)
+            return self._extract_score_metrics([{"role": "tool", "content": result}])
+        except Exception as e:
+            print(f"⚠️  ScoreTool fallback failed: {e}")
+            return {}
+
+    def _extract_competition_id(self, question: str) -> str | None:
+        """Extract competition id from the task prompt."""
+        if not question:
+            return None
+        match = re.search(r"Competition ID:\s*([^\s]+)", question)
+        if match:
+            return match.group(1).strip()
+        return None
+
     def _count_errors(self, trajectory: Trajectory) -> tuple[int, float]:
         """Count observations that look like errors/timeouts and return (count, rate)."""
         err_markers = ("[error", "error:", "timeout", "[timeout", "failed", "exception")
@@ -199,7 +249,7 @@ class DeepResearchWorkflow(Workflow):
         }
         return reward, extra
 
-    def _convert_to_episode(self, result: dict, task: dict, uid: str) -> Episode:
+    def _convert_to_episode(self, result: dict, task: dict, uid: str, score_metrics: dict | None = None) -> Episode:
         """
         Convert DeepResearch result to rLLM Episode format.
 
@@ -239,14 +289,14 @@ class DeepResearchWorkflow(Workflow):
 
         # Determine if the answer is correct (if ground truth available)
         prediction = result.get("prediction", "")
-        score_metrics = self._extract_score_metrics(messages)
+        score_metrics = score_metrics or self._extract_score_metrics(messages)
 
         error_count, error_rate = self._count_errors(trajectory)
         message_count = len(messages)
         reward_value, reward_details = self._score_to_reward(score_metrics, error_count, error_rate, message_count)
 
         # For our Kaggle-style tasks, correctness is tied to reward from ScoreTool
-        is_correct = reward_value > 0
+        is_correct = True if score_metrics else False
 
         # Map termination reason
         termination_reason = self._map_termination_reason(result.get("termination", "unknown"))
