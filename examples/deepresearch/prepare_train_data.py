@@ -33,7 +33,7 @@ def prepare_mle_train_data(competition_ids: list[str], data_root: Path, dataset_
     if not rows:
         raise ValueError("No rows generated; please check competition ids and data root.")
 
-    val_size = int(len(rows) * 0.1)
+    val_size = 64
     if val_size == 0 and len(rows) > 1:
         val_size = 1
 
@@ -74,7 +74,16 @@ def _list_synthetic_competitions(data_root: Path) -> list[str]:
     for entry in sorted(data_root.iterdir()):
         if not entry.is_dir():
             continue
-        desc_path = entry / "prepared" / "public" / "description.md"
+        public_dir = entry / "prepared" / "public"
+        # if public_dir.exists():
+        #     skip_entry = False
+        #     for item in public_dir.iterdir():
+        #         if "video" in item.name.lower() or "image" in item.name.lower() or "frame" in item.name.lower() or "doc" in item.name.lower():
+        #             skip_entry = True
+        #             break
+        #     if skip_entry:
+        #         continue
+        desc_path = public_dir / "description.md"
         if desc_path.exists():
             competition_ids.append(entry.name)
     return competition_ids

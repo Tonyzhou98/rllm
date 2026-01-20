@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import os
 from datetime import datetime
 from pathlib import Path
@@ -60,8 +61,8 @@ You are solving the task below. Follow the requirements precisely.
 
 Your code should adhere to the following requirements:
 - Prefer and explicitly use GPU (CUDA) acceleration when available (one A100 GPU should be available): move models/tensors to GPU and handle CPU fallback if CUDA is not present.
-- Each Python interpreter execution must finish within 5 mins (hard limit), so please do not use cross-validation or long training loops.
-- Overall runtime limits: the agent may take up to 30 turns, and the total program time budget (total tool calling + token generation) is 24 hours.
+- Each Python interpreter execution must finish within 1 min (hard limit), so please do not use cross-validation or long training loops and consider sampling the data.
+- Overall runtime limits: the agent may take up to 20 turns.
 - Load train/test data from the provided dataset folder (## Dataset Folder). Please first check the data files and their formats (file types, column names, row counts, etc.).
 - Match the exact columns/headers in sample_submission.csv (## Dataset Folder) and write submission.csv to the **current directory**.
 - Use only common preinstalled libraries (no installs).
@@ -132,6 +133,23 @@ def build_tasks(competition_ids: list[str], data_root: Path) -> list[dict]:
     return tasks
 
 
+def _extract_competition_id_from_task(task: dict) -> str:
+    question = task.get("question", "")
+    for line in question.splitlines():
+        if "## Competition ID:" in line:
+            return line.split("## Competition ID:", 1)[1].strip()
+    return ""
+
+
+def _has_python_timeout(episode) -> bool:
+    for traj in getattr(episode, "trajectories", []) or []:
+        for step in getattr(traj, "steps", []) or []:
+            obs = getattr(step, "observation", "")
+            if isinstance(obs, str) and "[Timeout] Exceeded" in obs:
+                return True
+    return False
+
+
 def _slugify(text: str) -> str:
     """Make a filesystem-friendly slug from model names like provider/model."""
     return "".join(c if c.isalnum() or c in "-._" else "_" for c in text)
@@ -184,13 +202,13 @@ def create_rollout_engine(model: str) -> OpenAIEngine:
     if "claude" in model:
         return OpenAIEngine(model=model, api_key=resolved_api_key, base_url="https://openrouter.ai/api/v1")
     elif "qwen" in model:
-        return OpenAIEngine(model="qwen3_8b_serve", api_key="None", base_url="http://h200-060-102:8001/v1")
+        return OpenAIEngine(model="qwen3_8b_serve", api_key="None", base_url="http://h200-149-009:8001/v1")
     else:
         raise ValueError(f"Unsupported model specified: {model}")
 
 async def main():
     args = parse_args()
-    setup_output_directory(args.model)
+    run_dir = setup_output_directory(args.model)
     data_root = Path("/fsx/zyhang/mle-bench-syn" if args.synthetic else "/fsx/zyhang/mle-bench-data")
     print("Data root:", data_root)
 
@@ -211,16 +229,48 @@ async def main():
         n_parallel_tasks=args.parallel_tasks,
     )
 
-    tasks = build_tasks(competition_id_list, data_root)
-    episodes = await workflow_engine.execute_tasks(tasks)
+    if args.synthetic:
+        competition_ids = []
+        for entry in sorted(data_root.iterdir()):
+            if not entry.is_dir():
+                continue
+            if (entry / "prepared" / "public" / "description.md").exists():
+                competition_ids.append(entry.name)
+    else:
+        competition_ids = competition_id_list
 
-    # Episodes contain full trajectories for training
-    for episode in episodes:
-        # print(f"Task: {episode.task}")
-        # print(f"Prediction: {episode.metrics.get('prediction')}")
-        print(f"Is correct: {episode.is_correct}")
-        print(f"Reward: {episode.metrics.get('reward')}")
-        print(f"Reward details: {episode.metrics.get('reward_details')}")
+    tasks = build_tasks(competition_ids, data_root)
+    summaries = []
+    batch_size = 32
+    for i in range(0, len(tasks), batch_size):
+        batch_tasks = tasks[i : i + batch_size]
+        batch_start = i
+        batch_end = min(i + batch_size, len(tasks))
+        output_path = run_dir / f"episode_summaries_{batch_start}_{batch_end}.json"
+        episodes = None
+        try:
+            episodes = await workflow_engine.execute_tasks(batch_tasks)
+        finally:
+            if episodes:
+                # Episodes contain full trajectories for training
+                for episode in episodes:
+                    # print(f"Task: {episode.task}")
+                    # # print(f"Prediction: {episode.metrics.get('prediction')}")
+                    # print(f"Is correct: {episode.is_correct}")
+                    # print(f"Reward: {episode.metrics.get('reward')}")
+                    # print(f"Reward details: {episode.metrics.get('reward_details')}")
+                    # print(f"Time taken (s): {episode.metrics.get('time_taken')}")
+                    summaries.append(
+                        {
+                            "competition_id": _extract_competition_id_from_task(episode.task),
+                            "is_correct": episode.is_correct,
+                            "reward": episode.metrics.get("reward"),
+                            "reward_details": episode.metrics.get("reward_details"),
+                            "time_taken": episode.metrics.get("time_taken"),
+                            "python_timeout": _has_python_timeout(episode),
+                        }
+                    )
+            output_path.write_text(json.dumps(summaries, indent=2), encoding="utf-8")
 
 if __name__ == "__main__":
     asyncio.run(main())

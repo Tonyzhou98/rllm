@@ -236,11 +236,21 @@ class QwenToolParser(ToolParser):
             # Extract and parse the JSON content
             json_content = text[start:end].strip()
             try:
-                call_data = json.loads(json_content)
-                # Convert to common format matching parse_tool_calls output
-                tool_calls.append({"name": call_data["name"], "arguments": call_data["arguments"]})
+                if "python" not in json_content or "<code>" not in json_content or "import" not in json_content:
+                    call_data = json.loads(json_content)
+                    # Convert to common format matching parse_tool_calls output
+                    tool_calls.append({"name": call_data["name"], "arguments": call_data["arguments"]})
+                else:
+                    # Special handling for Python tool calls with code blocks
+                    if "<code>" in json_content and "</code>" in json_content:
+                        code_start = json_content.find("<code>") + len("<code>")
+                        code_end = json_content.find("</code>")
+                        code_snippet = json_content[code_start:code_end].strip()
+                    else:
+                        code_snippet = json_content.strip()
+                    tool_calls.append({"name": "python", "arguments": {"code": code_snippet}})
             except json.JSONDecodeError:
-                print(f"Error parsing tool call: {json_content}")
+                # print(f"Error parsing tool call: {json_content}")
                 text = text[end + len(self.tool_call_end) :]
                 continue
 

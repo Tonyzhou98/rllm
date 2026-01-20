@@ -22,7 +22,7 @@ from rllm.engine.rollout import RolloutEngine
 # Constants from original DeepResearch
 OBS_START = "<tool_response>"
 OBS_END = "\n</tool_response>"
-MAX_LLM_CALL_PER_RUN = 30
+MAX_LLM_CALL_PER_RUN = 15
 
 # System prompt adapted from DeepResearch
 # DEEPRESEARCH_SYSTEM_PROMPT = """You are a deep research assistant. Your core function is to conduct thorough, multi-source investigations into any topic. You MUST use the provided tools to research and verify information before answering. Do NOT answer directly from memory - always use tools to gather current, accurate information.
@@ -162,7 +162,13 @@ class MultiTurnReactAgent:
         self.system_prompt = system_prompt
         self.use_native_function_calling = use_native_function_calling
         # Remember the original base output directory once to avoid nesting across tasks
-        self.base_output_dir = Path(os.environ.get("DEEPRESEARCH_OUTPUT_DIR", Path.cwd())).resolve()
+        env_output_dir = os.environ.get("DEEPRESEARCH_OUTPUT_DIR")
+        if env_output_dir:
+            self.base_output_dir = Path(env_output_dir).resolve()
+        else:
+            output_root = Path("/fsx/zyhang/rllm/examples/deepresearch/output")
+            candidates = sorted(output_root.glob("train-*"), key=lambda p: p.name, reverse=True)
+            self.base_output_dir = (candidates[0] if candidates else Path.cwd()).resolve()
 
         # Convert tools to OpenAI format if using native function calling
         if use_native_function_calling and self.tools:
@@ -172,7 +178,7 @@ class MultiTurnReactAgent:
 
         # Configuration from original DeepResearch
         self.max_llm_calls = MAX_LLM_CALL_PER_RUN
-        self.max_time = 24 * 60 * 60  # 24 hours timeout
+        self.max_time = 15 * 60  # 15 minutes timeout
 
         # Smart context management using actual API consumption
         self.total_prompt_tokens = 0
@@ -181,7 +187,7 @@ class MultiTurnReactAgent:
         # Auto-detect context limit based on model capabilities
         # This ensures we don't hit limits too early for capable models
         self.max_context_tokens = self._get_model_context_limit(rollout_engine)
-        print(f"   🎯 Using max context length: {self.max_context_tokens:,} tokens")
+        # print(f"   🎯 Using max context length: {self.max_context_tokens:,} tokens")
 
     def _setup_logging(self, output_dir: Path):
         """
@@ -207,7 +213,7 @@ class MultiTurnReactAgent:
         sys.stdout = _Tee(self._orig_stdout, self._log_file)
         sys.stderr = _Tee(self._orig_stderr, self._log_file)
 
-        print(f"[DeepResearch] Logging stdout/stderr to {log_path}")
+        # print(f"[DeepResearch] Logging stdout/stderr to {log_path}")
         self._current_log_path = log_path
 
     def _prepare_run_directory(self, question: str) -> Path:
@@ -241,7 +247,7 @@ class MultiTurnReactAgent:
                 max_tokens = model_info["max_input_tokens"]
                 conservative_limit = int(max_tokens * 0.90)  # Use 90% for safety
                 if not hasattr(MultiTurnReactAgent, "_context_limit_reported"):
-                    print(f"   📏 Detected context window: {max_tokens:,} tokens (using 90% = {conservative_limit:,})")
+                    # print(f"   📏 Detected context window: {max_tokens:,} tokens (using 90% = {conservative_limit:,})")
                     MultiTurnReactAgent._context_limit_reported = True
                 return conservative_limit
         except Exception:
@@ -264,7 +270,7 @@ class MultiTurnReactAgent:
                 max_tokens = encoding_limits[encoding.name]
                 conservative_limit = int(max_tokens * 0.90)
                 if not hasattr(MultiTurnReactAgent, "_context_limit_reported"):
-                    print(f"   📏 Inferred context from encoding '{encoding.name}': {conservative_limit:,} tokens")
+                    # print(f"   📏 Inferred context from encoding '{encoding.name}': {conservative_limit:,} tokens")
                     MultiTurnReactAgent._context_limit_reported = True
                 return conservative_limit
         except Exception:
@@ -296,14 +302,14 @@ class MultiTurnReactAgent:
             if any(pattern in model_lower for pattern in patterns):
                 conservative_limit = int(max_tokens * 0.90)
                 if not hasattr(MultiTurnReactAgent, "_context_limit_reported"):
-                    print(f"   📏 Pattern-matched context limit: {conservative_limit:,} tokens (90% of {max_tokens:,})")
+                    # print(f"   📏 Pattern-matched context limit: {conservative_limit:,} tokens (90% of {max_tokens:,})")
                     MultiTurnReactAgent._context_limit_reported = True
                 return conservative_limit
 
         # Method 4: Ultimate fallback
         default_limit = 100 * 1024
         if not hasattr(MultiTurnReactAgent, "_context_limit_reported"):
-            print(f"   ⚠️  Unknown model '{model_name}', using conservative default: {default_limit:,} tokens")
+            # print(f"   ⚠️  Unknown model '{model_name}', using conservative default: {default_limit:,} tokens")
             MultiTurnReactAgent._context_limit_reported = True
         return default_limit
 
@@ -311,7 +317,7 @@ class MultiTurnReactAgent:
         """Check if the model output contains the expected thinking structure."""
         return "<think>" in content and "</think>" in content
 
-    async def call_server(self, messages: list[dict], max_tries: int = 10):
+    async def call_server(self, messages: list[dict], max_tries: int = 2, timeout_s: int = 120):
         """
         Call rLLM OpenAI engine with hybrid mode support.
 
@@ -326,81 +332,25 @@ class MultiTurnReactAgent:
         Returns:
             ModelOutput with text and tool_calls
         """
-        for attempt in range(max_tries):
+        try:
+            api_params = {"messages": messages}
+            task = asyncio.create_task(self.rollout_engine.get_model_response(**api_params))
             try:
-                # Base parameters
-                api_params = {"messages": messages}
-
-                # Model-specific parameter configuration
-                # model_name = self.rollout_engine.model.lower()
-                model_name = "qwen3"
-
-                if "o3" in model_name or "o1" in model_name or "gpt-5" in model_name:
-                    # O3/O1/GPT-5: Very limited parameter support
-                    api_params["max_completion_tokens"] = 8192
-                elif "gpt-4" in model_name:
-                    # GPT-4: Full parameter support
-                    api_params.update(
-                        {
-                            "stop": ["\n<tool_response>", "<tool_response>"],
-                            "temperature": 1.0,
-                            "top_p": 0.95,
-                            "max_tokens": 4096,
-                            "presence_penalty": 1.1,
-                        }
-                    )
-                elif "qwen" in model_name:
-                    # Qwen models
-                    api_params.update(
-                        {
-                            "temperature": 1.0,
-                            "top_p": 0.95,
-                            "max_tokens": 8192,
-                        }
-                    )
-                elif "claude" in model_name:
-                    # Claude models
-                    api_params.update(
-                        {
-                            "temperature": 1.0,
-                            "top_p": 0.95,
-                            "max_tokens": 8192,
-                        }
-                    )
-                else:
-                    # Fallback: Conservative params
-                    api_params.update(
-                        {
-                            "temperature": 1.0,
-                            "max_tokens": 8192,
-                        }
-                    )
-
-                # Add tools parameter for native function calling
-                if self.use_native_function_calling and self.openai_tools:
-                    api_params["tools"] = self.openai_tools
-                    api_params["tool_choice"] = "auto"
-
-                # Call rLLM OpenAI Engine
-                response = await self.rollout_engine.get_model_response(**api_params)
-
-                # Track actual token consumption from API
-                if hasattr(response, "prompt_length") and hasattr(response, "completion_length"):
-                    self.total_prompt_tokens += response.prompt_length
-                    self.total_completion_tokens += response.completion_length
-
-                # Return full ModelOutput (contains both text and tool_calls)
-                return response
-
-            except Exception as e:
-                print(f"Error: Attempt {attempt + 1} failed: {e}")
-                if attempt < max_tries - 1:
-                    # Exponential backoff
-                    sleep_time = 2**attempt
-                    print(f"Waiting {sleep_time} seconds before retry...")
-                    await asyncio.sleep(sleep_time)
-
-        raise Exception(f"Failed to get response after {max_tries} attempts")
+                response = await asyncio.wait_for(task, timeout=timeout_s)
+            except asyncio.TimeoutError:
+                print(f"{self.competition_id}: [DeepResearch] call_server timed out after {timeout_s} seconds.")
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=2)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+                return None
+            if hasattr(response, "prompt_length") and hasattr(response, "completion_length"):
+                self.total_prompt_tokens += response.prompt_length
+                self.total_completion_tokens += response.completion_length
+            return response
+        except Exception:
+            return None
 
     def _estimate_context_tokens(self, messages: list[dict]) -> int:
         """
@@ -519,13 +469,14 @@ class MultiTurnReactAgent:
         start_time = time.time()
 
         # Prepare competition-specific output directory and logging
+        self.competition_id = extract_competition_id_from_prompt(question)
         run_dir = self._prepare_run_directory(question)
         self.current_run_dir = run_dir
         self._setup_logging(run_dir)
 
         # Setup system prompt with current date
         system_prompt = self.system_prompt + today_date()
-        print(f"📜 System Prompt:\n{system_prompt}\n")
+        # print(f"📜 System Prompt:\n{system_prompt}\n")
 
         # Construct initial user message (multimodal if images present)
         if images:
@@ -552,13 +503,14 @@ class MultiTurnReactAgent:
         q_display = str(question).replace("\n", " ").strip()
         if len(q_display) > 200:
             q_display = q_display[:200] + "..."
-        print(f"🔍 Starting DeepResearch for question: {q_display}")
+        # print(f"🔍 Starting DeepResearch for question: {q_display}")
 
         while num_llm_calls_available > 0:
             # Check time limit (150 minutes)
             if time.time() - start_time > self.max_time:
-                prediction = "No answer found after 2h30mins"
-                termination = "No answer found after 2h30mins"
+                prediction = f"No answer found after {self.max_time} seconds"
+                print(f"{self.competition_id}: [DeepResearch] Time limit exceeded ({self.max_time} seconds). Terminating.")
+                termination = f"timeout"
                 result = {
                     "question": question,
                     "answer": answer,
@@ -572,7 +524,21 @@ class MultiTurnReactAgent:
             num_llm_calls_available -= 1
 
             # Get model response (ModelOutput with text and tool_calls)
+            print(f"{self.competition_id}: [DeepResearch] Starting LLM call {round}.")
             response = await self.call_server(messages)
+            print(f"{self.competition_id}: [DeepResearch] Round {round} LLM call completed.")
+            if response is None:
+                prediction = "No answer found due to call_server timeout/None response"
+                termination = f"timeout"
+                print(f"{self.competition_id}: [DeepResearch] call_server returned None or timed out.")
+                result = {
+                    "question": question,
+                    "answer": answer,
+                    "messages": messages,
+                    "prediction": prediction,
+                    "termination": termination,
+                }
+                return result
 
             # Extract text content (may be None for pure function calling)
             content = response.text if hasattr(response, "text") and response.text else ""
@@ -584,8 +550,8 @@ class MultiTurnReactAgent:
                 content = content[:start_idx] + content[end_idx:]
 
             # Debug: Print raw model response to see format
-            if round == 1:
-                print(f"[DEBUG] Raw model response (first 500 chars): {content[:500]}")
+            # if round == 1:
+                # print(f"[DEBUG] Raw model response (first 500 chars): {content[:500]}")
                 # if hasattr(response, "tool_calls") and response.tool_calls:
                 #     print(f"[DEBUG] Native tool_calls detected: {len(response.tool_calls)} call(s)")
 
@@ -610,8 +576,8 @@ class MultiTurnReactAgent:
             if "<tool_call>" in content:
                 # Extract tool name for display
                 if "python" in content.lower() or "<code>" in content.lower():
-                    print(f"Round {round}: 🐍 Executing Python code")
-                    print(f"Model response: {content}")
+                    print(f"{self.competition_id}: [DeepResearch] Round {round}: 🐍 Executing Python code")
+                    # print(f"Model response: {content}")
                 elif '"name":' in content:
                     try:
                         import json5
@@ -622,25 +588,26 @@ class MultiTurnReactAgent:
                         tool_name = tool_data.get("name", "Unknown")
                         if "arguments" in tool_data:
                             args_str = truncate(str(tool_data["arguments"]), 100)
-                            print(f"Round {round}: 🔧 Calling {tool_name} with args: {args_str}")
+                            print(f"{self.competition_id}: [DeepResearch] Round {round}: 🔧 Calling {tool_name} with args: {args_str}")
                         else:
-                            print(f"Round {round}: 🔧 Calling {tool_name}")
+                            print(f"{self.competition_id}: [DeepResearch] Round {round}: 🔧 Calling {tool_name}")
                     except Exception as e:
-                        print(f"Error parsing tool call: {e}")
-                        print(f"Round {round}: 🔧 Tool call")
+                        print(f"{self.competition_id}: [DeepResearch] Error parsing tool call: {e}")
+                        print(f"{self.competition_id}: [DeepResearch] Round {round}: 🔧 Tool call")
                 else:
-                    print(f"Round {round}: 🔧 Tool call, Content snippet: {truncate(content, 100)}")
+                    print(f"{self.competition_id}: [DeepResearch] Round {round}: 🔧 Tool call, Content snippet: {truncate(content, 100)}")
             elif "<answer>" in content:
                 # Final answer
                 answer_preview = content.split("<answer>")[1].split("</answer>")[0]
-                print(f"Round {round}: ✅ Final answer: {content}")
+                print(f"{self.competition_id}: [DeepResearch] Round {round}: ✅ Final answer: {content}")
             else:
                 # Show internal reasoning if available, otherwise show content
                 if hasattr(response, "reasoning") and response.reasoning:
                     reasoning_preview = truncate(response.reasoning, 300)
-                    print(f"Round {round}: 💭 [Internal] {reasoning_preview}")
+                    print(f"{self.competition_id}: [DeepResearch] Round {round}: 💭 [Internal] {reasoning_preview}")
                 elif content:
-                    print(f"Round {round}: 💭 Reasoning: {content}")
+                    content_preview = truncate(content, 300)
+                    print(f"{self.competition_id}: [DeepResearch] Round {round}: 💭 Reasoning: {content_preview}")
 
             # Clean up content if it contains tool_response
             if "<tool_response>" in content:
@@ -733,7 +700,7 @@ class MultiTurnReactAgent:
                                 raise ValueError("No <code> blocks found in tool call.")
                             merged_code = "\n\n".join(block.strip() for block in code_blocks if block.strip())
                             result = await self.execute_python(merged_code)
-                            print(f"Round {round}: 🐍 Python execution result: {result}")
+                            print(f"{self.competition_id}: [DeepResearch] Round {round}: 🐍 Python execution finished")
                         except Exception:
                             result = "[Python Interpreter Error]: Formatting error. You must wrap your code within <code></code> tags."
                     else:
@@ -742,14 +709,14 @@ class MultiTurnReactAgent:
                         tool_name = tool_call.get("name", "")
                         tool_args = tool_call.get("arguments", {})
                         result = await self.custom_call_tool(tool_name, tool_args)
-                        print(f"Round {round}: 🛠️ Tool {tool_name} returned: {str(result)}")
+                        print(f"{self.competition_id}: [DeepResearch] Round {round}: 🛠️ Tool {tool_name} returned: {str(result)}")
 
                 except Exception:
                     result = 'Error: Tool call is not a valid JSON. Tool call must contain a valid "name" and "arguments" field.'
 
                 # Add tool response in ReAct format
                 tool_response = f"<tool_response>\n{result}\n</tool_response>"
-                print(f"Round {round}: Tool response: {tool_response}")
+                # print(f"Round {round}: Tool response: {tool_response}")
                 messages.append({"role": "user", "content": tool_response})
 
             # Priority 3: No tool call, just reasoning or answer
@@ -781,7 +748,7 @@ class MultiTurnReactAgent:
                 self.total_completion_tokens = 0
                 removed = before - len(messages)
                 if removed > 0:
-                    print(f"Round {round}: 🧹 Pruned {removed} message(s) with failed tool outputs to save context.")
+                    print(f"{self.competition_id}: [DeepResearch] Round {round}: 🧹 Pruned {removed} message(s) with failed tool outputs to save context.")
                     continue  # retry loop with cleaned messages
 
                 # Fallback: keep system, original user, and last few exchanges
@@ -789,7 +756,7 @@ class MultiTurnReactAgent:
                     messages = messages[:2] + messages[-2:]
                     self.total_prompt_tokens = self._estimate_context_tokens(messages)
                     self.total_completion_tokens = 0
-                    print(f"Round {round}: ⚠️ Context still high; keeping recent history only.")
+                    # print(f"Round {round}: ⚠️ Context still high; keeping recent history only.")
                     continue
 
             #     # Instead of replacing the last message, add a clear instruction
@@ -842,7 +809,7 @@ class MultiTurnReactAgent:
             prediction = "No answer found."
             termination = "answer not found"
             if num_llm_calls_available == 0:
-                termination = "exceed available llm calls"
+                termination = "token_limit_no_answer"
 
         # Final result
         result = {
@@ -855,15 +822,15 @@ class MultiTurnReactAgent:
             "time_taken": time.time() - start_time,
         }
 
-        print("\n🏁 DeepResearch completed:")
-        print(f"   Rounds: {round}")
-        print(f"   Time: {result['time_taken']:.1f}s")
-        print(f"   Termination: {termination}")
+        # print("\n🏁 DeepResearch completed:")
+        # print(f"   Rounds: {round}")
+        # print(f"   Time: {result['time_taken']:.1f}s")
+        # print(f"   Termination: {termination}")
         # Truncate prediction for display
         pred_display = str(prediction).replace("\n", " ").strip()
         if len(pred_display) > 200:
             pred_display = pred_display[:200] + "..."
-        print(f"   Prediction: {pred_display}")
+        # print(f"   Prediction: {pred_display}")
 
         return result
 
@@ -916,15 +883,25 @@ class MultiTurnReactAgent:
         Returns:
             Execution result as string
         """
+        timeout_s = 60
         if "PythonInterpreter" in self.tools:
             try:
                 # Use the PythonInterpreter tool
                 tool = self.tools["PythonInterpreter"]
                 if hasattr(tool, "call"):
-                    if asyncio.iscoroutinefunction(tool.call):
-                        result = await tool.call(code=code, run_dir=getattr(self, "current_run_dir", None))
-                    else:
-                        result = tool.call(code=code, run_dir=getattr(self, "current_run_dir", None))
+                    task = asyncio.create_task(
+                        tool.call(code=code, run_dir=getattr(self, "current_run_dir", None))
+                    )
+                    try:
+                        result = await asyncio.wait_for(task, timeout=timeout_s)
+                    except asyncio.TimeoutError:
+                        task.cancel()
+                        try:
+                            await asyncio.wait_for(task, timeout=2)
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            pass
+                        print(f"{self.competition_id}: [DeepResearch] Python execution timed out after {timeout_s}s.")
+                        return f"[Timeout] Exceeded {timeout_s}s."
                     return str(result)
                 else:
                     return "PythonInterpreter tool is not callable"

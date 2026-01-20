@@ -1,3 +1,17 @@
+#!/bin/bash
+
+#SBATCH --chdir=/fsx/zyhang/rllm/
+#SBATCH --nodes 1 
+#SBATCH --tasks-per-node 8 
+#SBATCH --cpus-per-task 24 
+#SBATCH --gpus-per-node 8
+#SBATCH --mem 500G
+#SBATCH --time=48:00:00
+#SBATCH --job-name=mle_syn_qwen3_8b_rl_grpo_agent
+#SBATCH --output=/fsx/zyhang/rllm/examples/deepresearch/slurm/mle_syn_qwen3_8b_rl_grpo_agent.stdout
+#SBATCH --error=/fsx/zyhang/rllm/examples/deepresearch/slurm/mle_syn_qwen3_8b_rl_grpo_agent.stderr
+
+
 set -x
 
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
@@ -13,12 +27,7 @@ project_name="algoevolve"
 experiment_name="algoevolve_qwen3_8b_mle_syn"
 max_token_per_gpu=$((40960 * 2))
 
-run_root=/fsx/zyhang/rllm/examples/deepresearch/output
-ts=$(date +%Y%m%d-%H%M%S)
-export DEEPRESEARCH_OUTPUT_DIR=${run_root}/train-${ts}
-mkdir -p "${DEEPRESEARCH_OUTPUT_DIR}"
-
-python3 -m examples.deepresearch.custom_train \
+PYTHONUNBUFFERED=1 bash -c "python3 -m examples.deepresearch.custom_train \
     algorithm.adv_estimator=grpo \
     data.train_batch_size=16 \
     data.val_batch_size=64 \
@@ -43,10 +52,8 @@ python3 -m examples.deepresearch.custom_train \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode="async" \
     actor_rollout_ref.rollout.enforce_eager=False \
-    actor_rollout_ref.rollout.enable_prefix_caching=True \
-    actor_rollout_ref.rollout.max_num_batched_tokens=65536 \
     actor_rollout_ref.rollout.temperature=1.0 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
@@ -68,10 +75,13 @@ python3 -m examples.deepresearch.custom_train \
     trainer.default_local_dir=$CHECKPOINT_PATH/${project_name}/${experiment_name} \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.save_freq=10 \
-    trainer.test_freq=10 \
+    trainer.save_freq=20 \
+    trainer.test_freq=20 \
     trainer.default_hdfs_dir=null \
     rllm.workflow.use_workflow=True \
     rllm.workflow.n_parallel_tasks=64 \
     rllm.stepwise_advantage.enable=False \
-    trainer.total_epochs=20
+    trainer.total_epochs=20 2>&1
+      "
+
+wait

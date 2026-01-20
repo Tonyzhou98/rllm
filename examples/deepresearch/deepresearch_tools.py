@@ -15,6 +15,7 @@ import json
 import os
 import random
 import subprocess
+import signal
 from abc import ABC, abstractmethod
 from collections import deque
 from datetime import datetime
@@ -749,7 +750,7 @@ class PythonInterpreterTool(DeepResearchTool):
                 "required": ["code"],
             },
         )
-        self.timeout = 300  # Default timeout in seconds
+        self.timeout = 60  # Default timeout in seconds
 
     async def call(self, code: str, timeout: int = None, run_dir: str | Path | None = None, **kwargs) -> str:
         """
@@ -783,6 +784,8 @@ class PythonInterpreterTool(DeepResearchTool):
             use_srun = gpu_check.returncode != 0
         except FileNotFoundError:
             use_srun = True
+        
+        print(f"Do we use srun? {use_srun}")
 
         if use_srun:
             cmd = [
@@ -816,7 +819,7 @@ class PythonInterpreterTool(DeepResearchTool):
                 log_fp.write(text)
                 log_fp.flush()
                 # Stream live to user
-                print(text, end="", flush=True)
+                # print(text, end="", flush=True)
                 # Skip progress-bar style carriage-return updates in the returned tail to avoid bloating LLM context.
                 if "\r" in text:
                     continue
@@ -829,6 +832,7 @@ class PythonInterpreterTool(DeepResearchTool):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                start_new_session=True,
             )
         except FileNotFoundError as e:
             missing = "srun" if use_srun else "bash"
@@ -861,9 +865,14 @@ class PythonInterpreterTool(DeepResearchTool):
             try:
                 returncode = await asyncio.wait_for(proc.wait(), timeout=timeout)
             except asyncio.TimeoutError:
+                print("Process timed out, terminating...")
                 timed_out = True
-                proc.kill()
+                os.killpg(proc.pid, signal.SIGKILL)
                 returncode = await proc.wait()
+            except asyncio.CancelledError:
+                os.killpg(proc.pid, signal.SIGKILL)
+                await proc.wait()
+                raise
             finally:
                 await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
 

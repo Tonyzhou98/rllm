@@ -1,5 +1,4 @@
 import os
-from datetime import datetime
 from pathlib import Path
 
 import hydra
@@ -44,24 +43,8 @@ Current date: """
 SYNTHETIC_DATA = True
 
 
-def setup_output_directory() -> Path:
-    """
-    Create an output directory for DeepResearch artifacts/logs and expose it via env var.
-    Avoids scattering run files when launched from repo root.
-    """
-    base_dir = Path(__file__).resolve().parent
-    output_root = base_dir / "output"
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = output_root / f"train-{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    os.environ["DEEPRESEARCH_OUTPUT_DIR"] = str(run_dir)
-    print(f"Saving DeepResearch artifacts to {run_dir}")
-    return run_dir
-
-
 @hydra.main(config_path="pkg://rllm.trainer.config", config_name="agent_ppo_trainer", version_base=None)
 def main(config):
-    setup_output_directory()
     dataset_name = "mle_bench_syn" if SYNTHETIC_DATA else "mle_bench"
     score_tool = SynScoreTool() if SYNTHETIC_DATA else ScoreTool()
     # Create trainer with your workflow

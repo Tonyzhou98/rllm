@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from rllm.agents.agent import Episode
+from rllm.agents.agent import Episode, Trajectory, Step, Action
 from rllm.engine.rollout import ModelOutput, RolloutEngine
 from rllm.utils import colorful_print
 from rllm.workflows.workflow import TerminationReason, Workflow
@@ -100,12 +100,60 @@ class AgentWorkflowEngine:
         """
         workflow = await self.workflow_queue.get()
         try:
+            # timeout_s = 900
             for retry_attempt in range(1, self.retry_limit + 1):
                 uid = f"{task_id}:{rollout_idx}"
                 episode = await workflow.run_with_termination_handling(task=task, uid=uid, **kwargs)
+                # try:
+                #     episode = await asyncio.wait_for(
+                #         workflow.run_with_termination_handling(task=task, uid=uid, **kwargs),
+                #         timeout=timeout_s,
+                #     )
+                # except asyncio.TimeoutError:
+                #     trajectory = Trajectory(task=task.get("question", ""))
+                #     system_prompt = workflow.system_prompt
+                #     question = task.get("question", "")
+                #     messages = [
+                #         {"role": "system", "content": system_prompt},
+                #         {"role": "user", "content": question},
+                #         {"role": "assistant", "content": f"Error: Rollout timed out after {timeout_s} seconds."},
+                #     ]
+                #     i = 0
+                #     while i < len(messages):
+                #         # Look for assistant messages (model responses)
+                #         if messages[i]["role"] == "assistant":
+                #             # Build chat completion context up to this point
+                #             current_context = messages[: i + 1]
+
+                #             # Create step
+                #             step = Step(
+                #                 chat_completions=current_context.copy(),
+                #                 model_response=messages[i]["content"],
+                #                 action=Action(action={"type": "reasoning", "content": (messages[i]["content"])}),
+                #                 observation="",  # No observation due to timeout
+                #                 reward=0.0,  # Will be computed later if needed
+                #             )
+
+                #             trajectory.steps.append(step)
+                #     # Create episode
+                #     episode = Episode()
+                #     episode.id = uid
+                #     episode.task = task
+                #     episode.termination_reason = TerminationReason.TIMEOUT
+                #     episode.is_correct = False
+                #     trajectory.name = "deepresearch_agent"
+                #     trajectory.reward = -0.01
+                #     episode.trajectories = [trajectory]
+                #     episode.metrics = {
+                #         "rounds": 0,
+                #         "time_taken": 900,
+                #         "reward": -0.01,
+                #     }
+                #     print(f"[{uid}] Rollout timed out after {timeout_s} seconds.")
+                #     return task_id, rollout_idx, episode
 
                 # Display rewards for all trajectories
-                rewards_str = ", ".join([f"{traj.name}: {traj.reward:.1f}" for traj in episode.trajectories])
+                rewards_str = ", ".join([f"{traj.name}: {traj.reward}" for traj in episode.trajectories])
                 colorful_print(f"[{uid}] Rollout completed. Rewards: {rewards_str}, Termination: {episode.termination_reason}", fg="green" if episode.is_correct else "yellow")
 
                 if episode.termination_reason != TerminationReason.ERROR:
