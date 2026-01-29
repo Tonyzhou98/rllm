@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 
 from rllm.data.dataset import DatasetRegistry
@@ -23,7 +24,7 @@ def build_rows(competition_ids: list[str], data_root: Path) -> list[dict]:
     return rows
 
 
-def prepare_mle_train_data(competition_ids: list[str], data_root: Path, dataset_name: str):
+def prepare_mle_train_data(competition_ids: list[str], data_root: Path, dataset_name: str, toy: bool = False):
     """
     Prepare a small mle_bench dataset (train/val) from the DeepResearch prompts.
     Validation takes 10% of rows and is removed from training data.
@@ -33,12 +34,17 @@ def prepare_mle_train_data(competition_ids: list[str], data_root: Path, dataset_
     if not rows:
         raise ValueError("No rows generated; please check competition ids and data root.")
 
-    val_size = 64
-    if val_size == 0 and len(rows) > 1:
-        val_size = 1
+    if toy:
+        toy_rows = rows[:8]
+        train_rows = toy_rows
+        val_rows = toy_rows
+    else:
+        val_size = 64
+        if val_size == 0 and len(rows) > 1:
+            val_size = 1
 
-    val_rows = rows[:val_size]
-    train_rows = rows[val_size:]
+        val_rows = rows[:val_size]
+        train_rows = rows[val_size:]
 
     train_dataset = DatasetRegistry.register_dataset(dataset_name, train_rows, "train")
     test_dataset = DatasetRegistry.register_dataset(dataset_name, val_rows, "test")
@@ -65,6 +71,11 @@ def parse_args() -> argparse.Namespace:
         default="spaceship-titanic,spooky-author-identification",
         help="Comma-separated competition ids.",
     )
+    parser.add_argument(
+        "--toy",
+        action="store_true",
+        help="Build a tiny synthetic dataset with 8 samples for both train and validation.",
+    )
     return parser.parse_args()
 
 def _list_synthetic_competitions(data_root: Path) -> list[str]:
@@ -89,12 +100,27 @@ def _list_synthetic_competitions(data_root: Path) -> list[str]:
     return competition_ids
 
 
+def _load_ok_competitions(path: Path) -> set[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing ok competitions list: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, list):
+        raise ValueError(f"Expected a list of competition ids in {path}")
+    return {str(item) for item in data}
+
+
 if __name__ == "__main__":
     args = parse_args()
     data_root = Path("/fsx/zyhang/mle-bench-syn" if args.synthetic else "/fsx/zyhang/mle-bench-data")
     dataset_name = "mle_bench_syn" if args.synthetic else "mle_bench"
+    if args.toy:
+        if not args.synthetic:
+            raise ValueError("--toy is only supported with --synthetic.")
+        dataset_name = f"{dataset_name}_toy"
     if args.synthetic:
-        competition_ids = _list_synthetic_competitions(data_root)
+        ok_ids = _load_ok_competitions(Path("/fsx/zyhang/AlgoEvolve/syn_data/ok_competitions_sanity.json"))
+        competition_ids = [cid for cid in _list_synthetic_competitions(data_root) if cid in ok_ids]
     else:
         competition_ids = [cid.strip() for cid in args.competition_ids.split(",") if cid.strip()]
-    prepare_mle_train_data(competition_ids, data_root, dataset_name)
+    prepare_mle_train_data(competition_ids, data_root, dataset_name, toy=args.toy)
