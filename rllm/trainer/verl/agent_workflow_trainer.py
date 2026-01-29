@@ -241,6 +241,14 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                             batch = batch[selected_mask]
 
                     if self.config.rllm.stepwise_advantage.enable and self.config.rllm.stepwise_advantage.mode == "broadcast":
+                        # Drop samples with empty responses to avoid NaNs during advantage broadcast.
+                        response_mask = batch.batch["response_mask"]
+                        valid_resp_mask = torch.sum(response_mask, dim=1) > 0
+                        if not torch.all(valid_resp_mask):
+                            batch = batch[valid_resp_mask]
+                            if len(batch) == 0:
+                                continue
+
                         # need to make sure both number of last steps (number of uids) and number of total steps in the batch
                         # (batch size after processing) are both multiples of world size
 
@@ -259,10 +267,20 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                         size_mask[:max_batch_size] = True
                         last_step_batch = last_step_batch[size_mask]  # filtered last steps
 
-                        # now we go through all the non_last_step_batch and keep everything that has same trajectory_id that exists in the filtered last steps
+                        # keep non-last steps that match both trajectory_id and episode_id from filtered last steps
                         valid_last_step_trajectory_ids = last_step_batch.non_tensor_batch["trajectory_ids"]
+                        valid_last_step_episode_ids = last_step_batch.non_tensor_batch["episode_ids"]
+                        valid_pairs = set(zip(valid_last_step_trajectory_ids, valid_last_step_episode_ids, strict=False))
+
                         non_last_step_trajectory_ids = non_last_step_batch.non_tensor_batch["trajectory_ids"]
-                        non_last_step_mask = np.isin(non_last_step_trajectory_ids, valid_last_step_trajectory_ids)
+                        non_last_step_episode_ids = non_last_step_batch.non_tensor_batch["episode_ids"]
+                        non_last_step_mask = np.array(
+                            [
+                                (traj_id, eps_id) in valid_pairs
+                                for traj_id, eps_id in zip(non_last_step_trajectory_ids, non_last_step_episode_ids, strict=False)
+                            ],
+                            dtype=bool,
+                        )
                         non_last_step_batch = non_last_step_batch[non_last_step_mask]
 
                         # concatenate then pad
@@ -608,7 +626,11 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
             traj_ep_to_scalar_adv[(traj_id, eps_id)] = scalar
 
         # Create new tensor for non_last_step_batch with per-token assignment
-        scalar_rows = torch.stack([torch.full_like(tgt_mask[i], fill_value=traj_ep_to_scalar_adv[(traj_id, eps_id)], dtype=torch.float32) for i, (traj_id, eps_id) in enumerate(zip(tgt_traj_ids, tgt_eps_ids, strict=False))])  # shape: (N2, T)
+        scalar_rows_list = []
+        for i, (traj_id, eps_id) in enumerate(zip(tgt_traj_ids, tgt_eps_ids, strict=False)):
+            scalar = traj_ep_to_scalar_adv.get((traj_id, eps_id), 0.0)
+            scalar_rows_list.append(torch.full_like(tgt_mask[i], fill_value=scalar, dtype=torch.float32))
+        scalar_rows = torch.stack(scalar_rows_list)  # shape: (N2, T)
 
         # Apply the response mask of the target batch
         final_advantage = scalar_rows * tgt_mask

@@ -61,7 +61,7 @@ You are solving the task below. Follow the requirements precisely.
 
 Your code should adhere to the following requirements:
 - Prefer and explicitly use GPU (CUDA) acceleration when available (one A100 GPU should be available): move models/tensors to GPU and handle CPU fallback if CUDA is not present.
-- Each Python interpreter execution must finish within 1 min (hard limit), so please do not use cross-validation or long training loops and consider sampling the data.
+- Each Python interpreter execution must finish within a given time limit.
 - Overall runtime limits: the agent may take up to 20 turns.
 - Load train/test data from the provided dataset folder (## Dataset Folder). Please first check the data files and their formats (file types, column names, row counts, etc.).
 - Match the exact columns/headers in sample_submission.csv (## Dataset Folder) and write submission.csv to the **current directory**.
@@ -71,36 +71,34 @@ Your code should adhere to the following requirements:
 - The task is an out-of-date competition, so please ignore the timeline in the task description.
 """
 
-# competition_id_list = [
-#     "aerial-cactus-identification",
-#     "aptos2019-blindness-detection",
-#     "denoising-dirty-documents",
-#     "detecting-insults-in-social-commentary",
-#     "dog-breed-identification",
-#     "dogs-vs-cats-redux-kernels-edition",
-#     "histopathologic-cancer-detection",
-#     "jigsaw-toxic-comment-classification-challenge",
-#     "leaf-classification",
-#     "mlsp-2013-birds",
-#     "new-york-city-taxi-fare-prediction",
-#     "nomad2018-predict-transparent-conductors",
-#     "plant-pathology-2020-fgvc7",
-#     "random-acts-of-pizza",
-#     "ranzcr-clip-catheter-line-classification",
-#     "siim-isic-melanoma-classification",
-#     "spooky-author-identification",
-#     "tabular-playground-series-dec-2021",
-#     "tabular-playground-series-may-2022",
-#     "text-normalization-challenge-english-language",
-#     "text-normalization-challenge-russian-language",
-#     "the-icml-2013-whale-challenge-right-whale-redux",
-# ]  # Hardcoded competition ids to run
+competition_id_list = [
+    "aerial-cactus-identification",
+    "aptos2019-blindness-detection",
+    "denoising-dirty-documents",
+    "detecting-insults-in-social-commentary",
+    "dog-breed-identification",
+    "dogs-vs-cats-redux-kernels-edition",
+    "histopathologic-cancer-detection",
+    "jigsaw-toxic-comment-classification-challenge",
+    "leaf-classification",
+    "mlsp-2013-birds",
+    "new-york-city-taxi-fare-prediction",
+    "nomad2018-predict-transparent-conductors",
+    "plant-pathology-2020-fgvc7",
+    "random-acts-of-pizza",
+    "ranzcr-clip-catheter-line-classification",
+    "siim-isic-melanoma-classification",
+    "spooky-author-identification",
+    "tabular-playground-series-dec-2021",
+    "tabular-playground-series-may-2022",
+    "text-normalization-challenge-english-language",
+    "text-normalization-challenge-russian-language",
+    "the-icml-2013-whale-challenge-right-whale-redux",
+]  # Hardcoded competition ids to run
 
 
 # competition_id_list = ["spaceship-titanic"]
 # competition_id_list = ["spaceship-titanic", "spooky-author-identification"]
-
-competition_id_list = ["multi-organ-thoracic-cancer-detection-from-low-dose-chest-ct-volumes"]
 
 
 def load_task_description(competition_id: str, data_root: Path) -> str:
@@ -114,10 +112,22 @@ def load_task_description(competition_id: str, data_root: Path) -> str:
     if not description_file.exists():
         raise FileNotFoundError(f"description.md not found for competition: {competition_id}")
 
-    return description_file.read_text().strip()
+    specific_task_description = description_file.read_text().strip()
+    entries = sorted(competition_path.iterdir(), key=lambda p: p.name)
+    files_list = []
+    for entry in entries:
+        name = entry.name
+        if entry.is_dir():
+            files_list.append(f"- **{competition_path / name}/**")
+        else:
+            files_list.append(f"- **{competition_path / name}**")
+    files_section = f"## Files Provided in **{str(competition_path)}**:\n" + "\n".join(files_list)
+    print("Files in competition folder:\n", files_section)
+
+    return f"{specific_task_description}\n\n{files_section}"
 
 
-def build_tasks(competition_ids: list[str], data_root: Path) -> list[dict]:
+def build_tasks(competition_ids: list[str], data_root: Path, args: argparse.Namespace) -> list[dict]:
     """Build user prompts/tasks for the provided competition ids."""
     tasks = []
     for competition_id in competition_ids:
@@ -128,7 +138,7 @@ def build_tasks(competition_ids: list[str], data_root: Path) -> list[dict]:
             .replace("{data_root}", str(data_root))
         )
         tasks.append(
-            {"question": user_prompt_template.replace("{specific_task_description}", specific_prompt)}
+            {"question": user_prompt_template.replace("{specific_task_description}", specific_prompt).replace("1 min", f"{args.python_timeout_s} seconds")}
         )
     return tasks
 
@@ -192,6 +202,36 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Use synthetic dataset from /fsx/zyhang/mle-bench-syn and SynScoreTool.",
     )
+    parser.add_argument(
+        "--max-llm-calls",
+        type=int,
+        default=15,
+        help="Maximum number of LLM calls per trajectory.",
+    )
+    parser.add_argument(
+        "--max-time-s",
+        type=int,
+        default=60 * 60,
+        help="Maximum wall-clock time per trajectory in seconds.",
+    )
+    parser.add_argument(
+        "--call-server-timeout-s",
+        type=int,
+        default=1800,
+        help="Timeout for model responses in seconds.",
+    )
+    parser.add_argument(
+        "--python-timeout-s",
+        type=int,
+        default=120,
+        help="Timeout for PythonInterpreter execution in seconds.",
+    )
+    parser.add_argument(
+        "--repeat-times",
+        type=int,
+        default=1,
+        help="Repeat each competition this many times for reward distribution.",
+    )
     return parser.parse_args()
 
 
@@ -202,7 +242,7 @@ def create_rollout_engine(model: str) -> OpenAIEngine:
     if "claude" in model:
         return OpenAIEngine(model=model, api_key=resolved_api_key, base_url="https://openrouter.ai/api/v1")
     elif "qwen" in model:
-        return OpenAIEngine(model="qwen3_8b_serve", api_key="None", base_url="http://h200-149-009:8001/v1")
+        return OpenAIEngine(model="qwen3_8b_serve", api_key="None", base_url="http://h200-011-039:8001/v1")
     else:
         raise ValueError(f"Unsupported model specified: {model}")
 
@@ -218,30 +258,49 @@ async def main():
         workflow_cls=DeepResearchWorkflow,
         workflow_args={
             "tools": {
-                "PythonInterpreter": PythonInterpreterTool(),
+                "PythonInterpreter": PythonInterpreterTool(
+                    timeout=args.python_timeout_s,
+                    job_name=os.environ.get("DEEPRESEARCH_API_JOB_NAME", "deepresearch_api_job"),
+                ),
                 "Score": score_tool,
             },
             "max_prompt_length": 4096,
             "max_response_length": 2048,
             "system_prompt": SYSTEM_PROMPT,
+            "max_llm_calls": args.max_llm_calls,
+            "max_time_s": args.max_time_s,
+            "call_server_timeout_s": args.call_server_timeout_s,
+            "python_timeout_s": args.python_timeout_s,
         },
         rollout_engine=engine,
         n_parallel_tasks=args.parallel_tasks,
     )
 
     if args.synthetic:
+        ok_list_path = Path("/fsx/zyhang/AlgoEvolve/syn_data/ok_competitions_sanity.json")
+        ok_candidates = json.loads(ok_list_path.read_text(encoding="utf-8"))
+        if not isinstance(ok_candidates, list):
+            raise ValueError(f"Expected list in {ok_list_path}")
+        ok_candidates = {str(item) for item in ok_candidates}
         competition_ids = []
         for entry in sorted(data_root.iterdir()):
             if not entry.is_dir():
+                continue
+            if entry.name not in ok_candidates:
                 continue
             if (entry / "prepared" / "public" / "description.md").exists():
                 competition_ids.append(entry.name)
     else:
         competition_ids = competition_id_list
 
-    tasks = build_tasks(competition_ids, data_root)
+    repeat_times = max(1, args.repeat_times)
+    repeated_competition_ids = []
+    for _ in range(repeat_times):
+        repeated_competition_ids.extend(competition_ids)
+    tasks = build_tasks(repeated_competition_ids, data_root, args)
     summaries = []
-    batch_size = 32
+    reward_distributions: dict[str, list] = {}
+    batch_size = 32 * repeat_times
     for i in range(0, len(tasks), batch_size):
         batch_tasks = tasks[i : i + batch_size]
         batch_start = i
@@ -260,17 +319,23 @@ async def main():
                     # print(f"Reward: {episode.metrics.get('reward')}")
                     # print(f"Reward details: {episode.metrics.get('reward_details')}")
                     # print(f"Time taken (s): {episode.metrics.get('time_taken')}")
+                    competition_id = _extract_competition_id_from_task(episode.task)
+                    reward_value = episode.metrics.get("reward")
                     summaries.append(
                         {
-                            "competition_id": _extract_competition_id_from_task(episode.task),
+                            "competition_id": competition_id,
                             "is_correct": episode.is_correct,
-                            "reward": episode.metrics.get("reward"),
+                            "reward": reward_value,
                             "reward_details": episode.metrics.get("reward_details"),
                             "time_taken": episode.metrics.get("time_taken"),
                             "python_timeout": _has_python_timeout(episode),
                         }
                     )
+                    reward_distributions.setdefault(competition_id, []).append(reward_value)
             output_path.write_text(json.dumps(summaries, indent=2), encoding="utf-8")
+
+    reward_output_path = run_dir / "reward_distributions.json"
+    reward_output_path.write_text(json.dumps(reward_distributions, indent=2), encoding="utf-8")
 
 if __name__ == "__main__":
     asyncio.run(main())

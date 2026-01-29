@@ -7,9 +7,9 @@
 #SBATCH --gpus-per-node 8
 #SBATCH --mem 500G
 #SBATCH --time=48:00:00
-#SBATCH --job-name=mle_syn_qwen3_8b_rl_grpo_agent_single_node
-#SBATCH --output=/fsx/zyhang/rllm/examples/deepresearch/slurm/mle_syn_qwen3_8b_rl_grpo_agent_single_node.stdout
-#SBATCH --error=/fsx/zyhang/rllm/examples/deepresearch/slurm/mle_syn_qwen3_8b_rl_grpo_agent_single_node.stderr
+#SBATCH --job-name=mle_syn_qwen3_14b_rl_grpo_agent_single_node_median_reward
+#SBATCH --output=/fsx/zyhang/rllm/examples/deepresearch/slurm/mle_syn_qwen3_14b_rl_grpo_agent_single_node_median_reward.stdout
+#SBATCH --error=/fsx/zyhang/rllm/examples/deepresearch/slurm/mle_syn_qwen3_14b_rl_grpo_agent_single_node_median_reward.stderr
 
 
 set -x
@@ -27,12 +27,14 @@ export SRUN_API_URL="http://10.136.114.209:9000"
 CHECKPOINT_PATH=/checkpoints/zyhang
 DATA_PATH=/fsx/zyhang/rllm/data/datasets
 project_name="algoevolve"
-experiment_name="algoevolve_qwen3_8b_mle_syn_single_node"
+experiment_name="algoevolve_qwen3_14b_mle_syn_single_node_median_reward"
 
 run_root=/fsx/zyhang/rllm/examples/deepresearch/output
 ts=$(date +%Y%m%d-%H%M%S)
 export DEEPRESEARCH_OUTPUT_DIR=${run_root}/train-${ts}
 mkdir -p "${DEEPRESEARCH_OUTPUT_DIR}"
+
+export DEEPRESEARCH_API_JOB_NAME=deepresearch_api_job_qwen3_14b
 
 PYTHONUNBUFFERED=1 bash -c "python3 -m examples.deepresearch.custom_train \
     algorithm.adv_estimator=grpo \
@@ -42,13 +44,13 @@ PYTHONUNBUFFERED=1 bash -c "python3 -m examples.deepresearch.custom_train \
     data.max_response_length=32768 \
     data.train_files=$DATA_PATH/mle_bench_syn/train.parquet \
     data.val_files=$DATA_PATH/mle_bench_syn/test.parquet \
-    actor_rollout_ref.model.path=/fsx/zyhang/Qwen/Qwen3-8B \
+    actor_rollout_ref.model.path=/fsx/zyhang/Qwen/Qwen3-14B \
     actor_rollout_ref.hybrid_engine=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
@@ -61,7 +63,6 @@ PYTHONUNBUFFERED=1 bash -c "python3 -m examples.deepresearch.custom_train \
     actor_rollout_ref.rollout.mode="async" \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
-    actor_rollout_ref.rollout.max_num_batched_tokens=65536 \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.n=4 \

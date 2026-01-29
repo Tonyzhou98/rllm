@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -256,6 +257,21 @@ class AgentWorkflowEngine:
         tasks = batch.non_tensor_batch["extra_info"].tolist()
         task_ids = batch.non_tensor_batch["task_ids"].tolist()
         results = await self.execute_tasks(tasks, task_ids, **kwargs)  # list of Episodes
+        job_name = os.environ.get("DEEPRESEARCH_API_JOB_NAME", "deepresearch_api_job")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "scancel",
+                "-n",
+                job_name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+        except FileNotFoundError:
+            logger.warning("scancel not found; skipping %s cleanup.", job_name)
+        except Exception:
+            logger.exception("Failed to scancel %s.", job_name)
+
         self.rollout_engine.validate = False
 
         await self.rollout_engine.sleep()
@@ -368,6 +384,7 @@ class AgentWorkflowEngine:
                             multi_modal_inputs_list.append(step.model_output.multi_modal_inputs or {})
 
                         else:
+                            # print(f"Tokenizing step {step_idx} of trajectory {trajectory_id} using chat completions and we strip think blocks for prompt.")
                             chat_completions = step.chat_completions
                             prompt, response, mask = self.rollout_engine.chat_parser.tokenize_and_mask(chat_completions)
                             prompts.append(prompt)

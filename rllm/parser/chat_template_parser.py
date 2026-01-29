@@ -114,8 +114,27 @@ class ChatTemplateParser:
             last_assistant_idx = max(i for i, msg in enumerate(messages) if msg["role"] == "assistant")
         except ValueError:
             raise ValueError("No assistant message found in chat_completions") from None
+        
+        def strip_think_blocks(messages: list[dict]) -> list[dict]:
+            """
+            Return a copy of messages with <think>...</think> removed from assistant content.
+            """
+            stripped = []
+            for msg in messages:
+                if msg.get("role") != "assistant":
+                    stripped.append(msg.copy())
+                    continue
+                new_msg = msg.copy()
+                content = new_msg["content"]
+                if "<think>" in content and "</think>" in content:
+                    start_idx = content.find("<think>")
+                    end_idx = content.find("</think>") + len("</think>")
+                    content = content[:start_idx] + content[end_idx:]
+                new_msg["content"] = content
+                stripped.append(new_msg)
+            return stripped
 
-        prompt = self.parse(messages[:last_assistant_idx], is_first_msg=True, add_generation_prompt=True, accumulate_reasoning=False)
+        prompt = self.parse(strip_think_blocks(messages[:last_assistant_idx]), is_first_msg=True, add_generation_prompt=True, accumulate_reasoning=False)
         prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
 
         response = self.parse([messages[last_assistant_idx]], is_first_msg=False, add_generation_prompt=False, accumulate_reasoning=True)

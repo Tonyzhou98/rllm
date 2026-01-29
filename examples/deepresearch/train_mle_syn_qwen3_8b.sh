@@ -7,9 +7,9 @@
 #SBATCH --gpus-per-node 8
 #SBATCH --mem 500G
 #SBATCH --time=48:00:00
-#SBATCH --job-name=mle_syn_qwen3_8b_rl_grpo_agent_single_node
-#SBATCH --output=/fsx/zyhang/rllm/examples/deepresearch/slurm/mle_syn_qwen3_8b_rl_grpo_agent_single_node.stdout
-#SBATCH --error=/fsx/zyhang/rllm/examples/deepresearch/slurm/mle_syn_qwen3_8b_rl_grpo_agent_single_node.stderr
+#SBATCH --job-name=mle_syn_qwen3_8b_rl_grpo_agent_single_node_median_reward
+#SBATCH --output=/fsx/zyhang/rllm/examples/deepresearch/slurm/mle_syn_qwen3_8b_rl_grpo_agent_single_node_median_reward.stdout
+#SBATCH --error=/fsx/zyhang/rllm/examples/deepresearch/slurm/mle_syn_qwen3_8b_rl_grpo_agent_single_node_median_reward.stderr
 
 
 set -x
@@ -27,12 +27,14 @@ export SRUN_API_URL="http://10.136.114.209:9000"
 CHECKPOINT_PATH=/checkpoints/zyhang
 DATA_PATH=/fsx/zyhang/rllm/data/datasets
 project_name="algoevolve"
-experiment_name="algoevolve_qwen3_8b_mle_syn_single_node"
+experiment_name="algoevolve_qwen3_8b_mle_syn_single_node_median_reward"
 
 run_root=/fsx/zyhang/rllm/examples/deepresearch/output
 ts=$(date +%Y%m%d-%H%M%S)
 export DEEPRESEARCH_OUTPUT_DIR=${run_root}/train-${ts}
 mkdir -p "${DEEPRESEARCH_OUTPUT_DIR}"
+
+export DEEPRESEARCH_API_JOB_NAME=deepresearch_api_job_qwen3_8b
 
 PYTHONUNBUFFERED=1 bash -c "python3 -m examples.deepresearch.custom_train \
     algorithm.adv_estimator=grpo \

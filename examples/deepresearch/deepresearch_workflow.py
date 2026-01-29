@@ -7,8 +7,10 @@ core reasoning capabilities.
 """
 
 import json
+import math
 import os
 import re
+from pathlib import Path
 
 try:
     # When imported as a package (python -m examples.deepresearch.custom_train)
@@ -38,6 +40,10 @@ class DeepResearchWorkflow(Workflow):
         executor,
         tools: dict = None,
         system_prompt: str = None,
+        max_llm_calls: int | None = None,
+        max_time_s: int | None = None,
+        call_server_timeout_s: int | None = None,
+        python_timeout_s: int | None = None,
         **kwargs,
     ):
         """
@@ -67,6 +73,17 @@ class DeepResearchWorkflow(Workflow):
             system_prompt=self.system_prompt,
             use_native_function_calling=False,
         )
+        if max_llm_calls is not None:
+            self.agent.max_llm_calls = max_llm_calls
+        if max_time_s is not None:
+            self.agent.max_time = max_time_s
+        if call_server_timeout_s is not None:
+            self.agent.call_server_timeout_s = call_server_timeout_s
+        if python_timeout_s is not None:
+            self.agent.python_timeout_s = python_timeout_s
+            python_tool = self.tools.get("PythonInterpreter")
+            if hasattr(python_tool, "timeout"):
+                python_tool.timeout = python_timeout_s
 
         # Note: We don't register the agent since DeepResearch handles its own trajectory
 
@@ -91,31 +108,32 @@ class DeepResearchWorkflow(Workflow):
         question = task.get("question", task.get("query", "No question provided"))
         answer = task.get("answer", "")
 
-        print(f"🚀 Starting DeepResearch workflow for task {uid}")
-        print(f"   Question: {question}")
+        # print(f"🚀 Starting DeepResearch workflow for task {uid}")
+        # print(f"   Question: {question}")
 
         try:
             # Run the DeepResearch agent
             result = await self.agent.run(question=question, answer=answer, **kwargs)
 
             messages = result.get("messages", [])
-            # score_metrics = self._extract_score_metrics(messages)
-            # if not score_metrics:
-            #     print("⚠️  No ScoreTool output found in conversation, running ScoreTool fallback...")
-            #     score_metrics = await self._maybe_run_score_tool(question, messages)
+            score_metrics = self._extract_score_metrics(messages)
+            if not score_metrics:
+                # print("⚠️  No ScoreTool output found in conversation, running ScoreTool fallback...")
+                score_metrics = await self._maybe_run_score_tool(question, messages)
 
-            score_metrics = await self._maybe_run_score_tool(question, messages)
-            print(f"   Score metrics: {score_metrics}")
+            # score_metrics = await self._maybe_run_score_tool(question, messages)
+            # print(f"   Score metrics: {score_metrics}")
             # Convert the result to rLLM Episode format
             episode = self._convert_to_episode(result, task, uid, score_metrics=score_metrics)
 
-            print(f"✅ DeepResearch workflow completed for task {uid}")
-            print(f"   Prediction: {result.get('prediction', 'No prediction')}")
+            competition_id = self._extract_competition_id(question) or "unknown"
+            print(f"✅ DeepResearch workflow completed for task {competition_id}")
+            # print(f"   Prediction: {result.get('prediction', 'No prediction')}")
 
             return episode
 
         except Exception as e:
-            print(f"❌ DeepResearch workflow failed for task {uid}: {e}")
+            # print(f"❌ DeepResearch workflow failed for task {uid}: {e}")
 
             # Create a failed episode
             episode = Episode()
@@ -172,22 +190,16 @@ class DeepResearchWorkflow(Workflow):
             return {}
 
         try:
-            run_dir = None
-            for msg in messages:
-                if not isinstance(msg, dict):
-                    continue
-                content = msg.get("content", "")
-                if isinstance(content, str) and "<output>" in content and "</output>" in content and "<answer>" in content and "</answer>" in content:
-                    run_dir = content.split("<output>", 1)[1].split("</output>", 1)[0].strip()
-                    print(f"Find output directory for ScoreTool fallback: {run_dir}")
-                    break
+            run_dir = messages[-1].get("content", "")
+            run_dir = run_dir.split("<output>", 1)[1].split("</output>", 1)[0].strip()
+            print(f"   Running ScoreTool fallback on run_dir: {run_dir}")
             if run_dir is None:
-                print("⚠️  No output directory found in conversation for ScoreTool fallback.")
+                # print("⚠️  No output directory found in conversation for ScoreTool fallback.")
                 return {}
             result = await score_tool.call(competition_id=competition_id, run_dir=run_dir)
             return self._extract_score_metrics([{"role": "tool", "content": result}])
         except Exception as e:
-            print(f"⚠️  ScoreTool fallback failed: {e}")
+            # print(f"⚠️  ScoreTool fallback failed: {e}")
             return {}
 
     def _extract_competition_id(self, question: str) -> str | None:
@@ -213,7 +225,7 @@ class DeepResearchWorkflow(Workflow):
         total_steps = max(1, len(trajectory.steps))
         return count, count / total_steps
 
-    def _score_to_reward(self, metrics: dict, error_count: int, error_rate: float, message_count: int) -> tuple[float, dict]:
+    def _score_to_reward(self, metrics: dict, error_count: int, error_rate: float, message_count: int, format_correct_rate: float) -> tuple[float, dict]:
         """
         Convert ScoreTool metrics into a scalar reward.
         - Uses score_primary and metric_lower_is_better.
@@ -223,17 +235,45 @@ class DeepResearchWorkflow(Workflow):
         reward = 0.0
         score = metrics.get("score_primary (main competition metric for current code)")
         lower_is_better = metrics.get("metric_lower_is_better") or metrics.get("metric_lower_is_better (true means lower score is better)")
+        # median_score = metrics.get("threshold_median (median submission score)")
+
+        # if score is not None and median_score is not None:
+        #     score = float(score)
+        #     median_score = float(median_score)
+        #     if lower_is_better:
+        #         if score > median_score:
+        #             score = None  # Treat worse-than-median as no score
+        #     else:
+        #         if score < median_score:
+        #             score = None  # Treat worse-than-median as no score
+
 
         if score is not None:
             try:
                 score_val = float(score)
-                reward = -score_val if lower_is_better else score_val
+                if lower_is_better:
+                    score_val = max(score_val, 0.0)
+                    reward = 0.7 * (1.0 / (1.0 + math.log1p(score_val)))
+                else:
+                    reward = 0.7 * math.log1p(max(score_val, 0.0))
+                
+                # Light penalties for noisy/long runs
+                # reward -= 0.02 * error_rate  # scaled by rate
+                # reward -= 0.005 * message_count  # discourage excessive turns
             except Exception:
                 reward = 0.0
 
-        # Light penalties for noisy/long runs
-        reward -= 0.02 * error_rate  # scaled by rate
-        reward -= 0.005 * message_count  # discourage excessive turns
+        reward += 0.1 * format_correct_rate
+
+        submission_path = metrics.get("submission_path")
+        submission_bonus = 0.0
+        if submission_path:
+            try:
+                if Path(str(submission_path)).exists():
+                    submission_bonus = 0.2
+            except Exception:
+                submission_bonus = 0.0
+        reward += submission_bonus
 
         # Clamp to keep extremes bounded
         reward = max(min(reward, 1e3), -1e3)
@@ -242,12 +282,29 @@ class DeepResearchWorkflow(Workflow):
             "reward_raw": reward,
             "score_primary": score,
             "metric_lower_is_better": lower_is_better,
-            "metric_lower_is_better (true means lower score is better)": lower_is_better,
             "error_count": error_count,
             "error_rate": error_rate,
             "message_count": message_count,
+            "format_correct_rate": format_correct_rate,
+            "submission_bonus": submission_bonus,
         }
         return reward, extra
+
+    def _format_correct_rate(self, messages: list[dict]) -> float:
+        assistant_msgs = [msg for msg in messages if msg.get("role") == "assistant"]
+        if not assistant_msgs:
+            return 0.0
+        correct = 0
+        for msg in assistant_msgs:
+            content = str(msg.get("content", "")).lstrip()
+            if not (content.startswith("<think>") and "</think>" in content):
+                continue
+            start_idx = content.find("<think>") + len("<think>")
+            end_idx = content.find("</think>")
+            think_body = content[start_idx:end_idx].strip().replace("\n", "").replace(" ", "")
+            if think_body:
+                correct += 1
+        return correct / len(assistant_msgs)
 
     def _convert_to_episode(self, result: dict, task: dict, uid: str, score_metrics: dict | None = None) -> Episode:
         """
@@ -267,6 +324,29 @@ class DeepResearchWorkflow(Workflow):
         # Convert conversation to steps
         messages = result.get("messages", [])
 
+        # Determine if the answer is correct (if ground truth available)
+        prediction = result.get("prediction", "")
+        score_metrics = score_metrics or self._extract_score_metrics(messages)
+
+        error_count, error_rate = self._count_errors(trajectory)
+        message_count = len(messages)
+        format_correct_rate = self._format_correct_rate(messages)
+        reward_value, reward_details = self._score_to_reward(
+            score_metrics,
+            error_count,
+            error_rate,
+            message_count,
+            format_correct_rate,
+        )
+
+        # remove "<output>...</output>" from the last message content
+
+        content = messages[-1]["content"]
+        if isinstance(content, str):
+            start_idx = content.find("<output>")
+            if start_idx != -1:
+                messages[-1]["content"] = content[:start_idx]
+        
         i = 0
         while i < len(messages):
             # Look for assistant messages (model responses)
@@ -286,14 +366,6 @@ class DeepResearchWorkflow(Workflow):
                 trajectory.steps.append(step)
 
             i += 1
-
-        # Determine if the answer is correct (if ground truth available)
-        prediction = result.get("prediction", "")
-        score_metrics = score_metrics or self._extract_score_metrics(messages)
-
-        error_count, error_rate = self._count_errors(trajectory)
-        message_count = len(messages)
-        reward_value, reward_details = self._score_to_reward(score_metrics, error_count, error_rate, message_count)
 
         # For our Kaggle-style tasks, correctness is tied to reward from ScoreTool
         is_correct = True if score_metrics else False
@@ -317,6 +389,9 @@ class DeepResearchWorkflow(Workflow):
             # "score_metrics": score_metrics,
             "reward": reward_value,
             "error_count": error_count,
+            "error_rate": error_rate,
+            "message_count": message_count,
+            "format_correct_rate": format_correct_rate,
             # "reward_details": reward_details,
         }
 

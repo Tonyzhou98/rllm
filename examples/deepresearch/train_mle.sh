@@ -61,5 +61,5 @@ python3 -m examples.deepresearch.custom_train \
     trainer.default_hdfs_dir=null \
     rllm.workflow.use_workflow=True \
     rllm.workflow.n_parallel_tasks=64 \
-    rllm.stepwise_advantage.enable=False \
+    rllm.stepwise_advantage.enable=True \
     trainer.total_epochs=100

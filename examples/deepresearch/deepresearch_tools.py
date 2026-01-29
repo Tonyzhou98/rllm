@@ -16,12 +16,174 @@ import os
 import random
 import subprocess
 import signal
+import logging
 from abc import ABC, abstractmethod
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from datetime import datetime, timezone
+from typing import Optional
+import httpx
 
 from rllm.tools.tool_base import Tool as RLLMTool
+
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+SRUN_API_URL = os.environ.get("SRUN_API_URL", "http://127.0.0.1:9000")
+DEFAULT_TOOL_TIMEOUT = 60  # seconds for the tool-level timeout
+POLL_INTERVAL = 2.0  # seconds between status polls to SRUN API
+
+async def submit_script_to_srun_api(
+    script_path: Path,
+    *,
+    conda_env: str = "algoevolve",
+    time: str = "02:00:00",
+    cpus: int = 8,
+    mem: str = "32G",
+    gres_gpus: str = "gpu:1",
+    pre_cmds: Optional[str] = None,
+    tool_timeout: int = 60,
+    sruns_api_url: str = SRUN_API_URL,
+    job_name: Optional[str] = None,
+) -> str:
+    """
+    Submit existing script_path to SRUN API and poll until completion or the tool-level timeout.
+    Returns a result string matching the old tool format:
+     - "[Output]\\n{stdout_tail}"
+     - "[Error] {stderr}" and path to logs
+     - "[Timeout] ..." etc.
+    """
+    if not script_path.exists() or not script_path.is_file():
+        return f"[Error] script not found: {script_path}"
+
+    payload = {
+        "script_path": str(script_path),
+        "time": time,
+        "cpus": cpus,
+        "mem": mem,
+        "gres_gpus": gres_gpus,
+        "conda_env": conda_env,
+        "pre_cmds": pre_cmds,
+        "job_name": job_name or os.environ.get("DEEPRESEARCH_API_JOB_NAME", "deepresearch_api_job"),
+        "timeout": 0,  # let API manage process lifetime; we enforce a tool-level timeout here
+    }
+
+    # Call SRUN API /run
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.post(f"{sruns_api_url.rstrip('/')}/run", json=payload)
+        except Exception as e:
+            return f"[Error] Failed to contact SRUN API at {sruns_api_url}: {e}"
+        if resp.status_code != 200:
+            return f"[Error] SRUN API returned {resp.status_code}: {resp.text}"
+
+        meta = resp.json()
+        job_id = meta.get("job_id")
+        workdir = Path(meta.get("workdir", str(script_path.parent)))
+        stdout_path = Path(meta.get("stdout")) if meta.get("stdout") else None
+        stderr_path = Path(meta.get("stderr")) if meta.get("stderr") else None
+
+    # Poll for completion and collect log tails
+    start = datetime.now(timezone.utc)
+    timed_out = False
+    stdout_tail = ""
+    stderr_tail = ""
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while True:
+            elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+            if tool_timeout and tool_timeout > 0 and elapsed > tool_timeout:
+                timed_out = True
+                # try to cancel via API
+                try:
+                    await client.post(f"{sruns_api_url.rstrip('/')}/cancel/{job_id}")
+                except Exception:
+                    pass
+                break
+
+            # get status
+            try:
+                s = await client.get(f"{sruns_api_url.rstrip('/')}/status/{job_id}")
+            except Exception:
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            if s.status_code != 200:
+                # status may not be available immediately; retry
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            st = s.json()
+            state = st.get("state", "").upper()
+
+            # fetch logs (tail)
+            try:
+                l = await client.get(f"{sruns_api_url.rstrip('/')}/logs/{job_id}", params={"tail_lines": 200})
+                if l.status_code == 200:
+                    logs = l.json()
+                    stdout_tail = logs.get("stdout_tail", "") or ""
+                    stderr_tail = logs.get("stderr_tail", "") or ""
+            except Exception:
+                # ignore transient log fetch errors
+                pass
+
+            if state in ("RUNNING", "PENDING"):
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            # completed or unknown
+            break
+
+    # helper truncate function
+    def _truncate_block(text: str, max_lines: int = 20) -> str:
+        if not text:
+            return text
+        lines = text.splitlines()
+        if len(lines) <= max_lines:
+            return text
+        tail = lines[-max_lines:]
+        truncated = len(lines) - max_lines
+        return "\n".join(tail + [f"...[truncated {truncated} lines, see log for full output]"])
+
+    stdout_tail = _truncate_block(stdout_tail.strip() if stdout_tail else "")
+    stderr_tail = _truncate_block(stderr_tail.strip() if stderr_tail else "")
+
+    # prefer submission.csv if exists
+    submission_path = script_path.parent / "submission.csv"
+
+    if timed_out:
+        return f"[Timeout] Exceeded {tool_timeout}s. Logs: {stdout_path or script_path.parent}"
+
+    if stdout_tail:
+        if stderr_tail:
+            if submission_path.exists():
+                return f"[Output]\n{stdout_tail}\n\n[Stderr]\n{stderr_tail}\n\nNote: submission.csv found at {submission_path}."
+            else:
+                return f"[Output]\n{stdout_tail}\n\n[Stderr]\n{stderr_tail}\n\nNote: submission.csv not found."
+        else:
+            if submission_path.exists():
+                return f"[Output]\n{stdout_tail}\n\nNote: no stderr, and submission.csv found at {submission_path}."
+            else:
+                return f"[Output]\n{stdout_tail}\n\nNote: no stderr, and submission.csv not found."
+
+    if stderr_tail:
+        if submission_path.exists():
+            return f"No stdout, but submission.csv found at {submission_path}. Stderr:\n{stderr_tail}"
+        return f"No stdout and submission.csv not found. Stderr:\n{stderr_tail}"
+
+    if submission_path.exists():
+        return f"No stdout, but submission.csv found at {submission_path}."
+
+    # fallback: if API provided stdout file, try to read last lines
+    if stdout_path and stdout_path.exists():
+        try:
+            text = stdout_path.read_text(errors="replace").splitlines()[-20:]
+            return "[Output]\n" + "\n".join(text)
+        except Exception:
+            pass
+
+    return "No stdout and submission.csv not found."
 
 
 class DeepResearchTool(RLLMTool, ABC):
@@ -740,7 +902,7 @@ class SynScoreTool(DeepResearchTool):
 class PythonInterpreterTool(DeepResearchTool):
     """Safe Python code execution (from existing implementation)."""
 
-    def __init__(self):
+    def __init__(self, timeout: int = 120, job_name: str | None = None):
         super().__init__(
             name="PythonInterpreter",
             description="Execute Python code for calculations and analysis",
@@ -750,7 +912,8 @@ class PythonInterpreterTool(DeepResearchTool):
                 "required": ["code"],
             },
         )
-        self.timeout = 60  # Default timeout in seconds
+        self.timeout = timeout  # Default timeout in seconds
+        self.job_name = job_name
 
     async def call(self, code: str, timeout: int = None, run_dir: str | Path | None = None, **kwargs) -> str:
         """
@@ -770,142 +933,156 @@ class PythonInterpreterTool(DeepResearchTool):
         log_path = run_dir / f"main_{ts}.log"
 
         script_path.write_text(code, encoding="utf-8")
-
         conda_env = os.environ.get("DEEPRESEARCH_CONDA_ENV", "algoevolve")
-        bash_cmd = f"source ~/miniconda3/bin/activate && conda activate {conda_env} && python -u {script_filename} && conda deactivate && conda activate rllm"
-        use_srun = False
-        try:
-            gpu_check = subprocess.run(
-                ["nvidia-smi"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-            use_srun = gpu_check.returncode != 0
-        except FileNotFoundError:
-            use_srun = True
+
+        result = await submit_script_to_srun_api(
+            script_path,
+            conda_env=conda_env,
+            time="02:00:00",
+            cpus=8,
+            mem="32G",
+            gres_gpus="gpu:1",
+            pre_cmds=None,
+            tool_timeout=timeout,
+            sruns_api_url=SRUN_API_URL,
+            job_name=self.job_name,
+        )
+        return result
+
+        # bash_cmd = f"source ~/miniconda3/bin/activate && conda activate {conda_env} && python -u {script_filename} && conda deactivate && conda activate rllm"
+        # use_srun = False
+        # try:
+        #     gpu_check = subprocess.run(
+        #         ["nvidia-smi"],
+        #         stdout=subprocess.DEVNULL,
+        #         stderr=subprocess.DEVNULL,
+        #         check=False,
+        #     )
+        #     use_srun = gpu_check.returncode != 0
+        # except FileNotFoundError:
+        #     use_srun = True
         
-        print(f"Do we use srun? {use_srun}")
+        # # print(f"Do we use srun? {use_srun}")
 
-        if use_srun:
-            cmd = [
-                "srun",
-                "--gres=gpu:1",
-                "--ntasks=1",
-                "--cpus-per-task=64",
-                "--time=2-00:00:00",
-                "bash",
-                "-lc",
-                bash_cmd,
-            ]
-        else:
-            cmd = ["bash", "-lc", bash_cmd]
+        # if use_srun:
+        #     cmd = [
+        #         "srun",
+        #         "--gres=gpu:1",
+        #         "--ntasks=1",
+        #         "--cpus-per-task=64",
+        #         "--time=2-00:00:00",
+        #         "bash",
+        #         "-lc",
+        #         bash_cmd,
+        #     ]
+        # else:
+        #     cmd = ["bash", "-lc", bash_cmd]
 
-        # Pin each run to a random GPU when none is specified to spread load across 8-GPU node.
-        env = os.environ.copy()
-        if not env.get("CUDA_VISIBLE_DEVICES"):
-            try:
-                gpu_count = int(env.get("DEEPRESEARCH_GPU_COUNT", "8"))
-                env["CUDA_VISIBLE_DEVICES"] = str(random.randrange(gpu_count))
-            except Exception:
-                pass
+        # # Pin each run to a random GPU when none is specified to spread load across 8-GPU node.
+        # env = os.environ.copy()
+        # if not env.get("CUDA_VISIBLE_DEVICES"):
+        #     try:
+        #         gpu_count = int(env.get("DEEPRESEARCH_GPU_COUNT", "8"))
+        #         env["CUDA_VISIBLE_DEVICES"] = str(random.randrange(gpu_count))
+        #     except Exception:
+        #         pass
 
-        async def _stream_output(stream, log_fp, buf: deque, prefix: str = ""):
-            while True:
-                line = await stream.readline()
-                if not line:
-                    break
-                text = prefix + line.decode(errors="replace")
-                log_fp.write(text)
-                log_fp.flush()
-                # Stream live to user
-                # print(text, end="", flush=True)
-                # Skip progress-bar style carriage-return updates in the returned tail to avoid bloating LLM context.
-                if "\r" in text:
-                    continue
-                buf.append(text)
+        # async def _stream_output(stream, log_fp, buf: deque, prefix: str = ""):
+        #     while True:
+        #         line = await stream.readline()
+        #         if not line:
+        #             break
+        #         text = prefix + line.decode(errors="replace")
+        #         log_fp.write(text)
+        #         log_fp.flush()
+        #         # Stream live to user
+        #         # print(text, end="", flush=True)
+        #         # Skip progress-bar style carriage-return updates in the returned tail to avoid bloating LLM context.
+        #         if "\r" in text:
+        #             continue
+        #         buf.append(text)
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(run_dir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                start_new_session=True,
-            )
-        except FileNotFoundError as e:
-            missing = "srun" if use_srun else "bash"
-            return f"[Error] {missing} not found: {e}"
-        except Exception as e:
-            launcher = "srun" if use_srun else "bash"
-            return f"[Error] Failed to start {launcher}: {e}"
+        # try:
+        #     proc = await asyncio.create_subprocess_exec(
+        #         *cmd,
+        #         cwd=str(run_dir),
+        #         stdout=asyncio.subprocess.PIPE,
+        #         stderr=asyncio.subprocess.PIPE,
+        #         env=env,
+        #         start_new_session=True,
+        #     )
+        # except FileNotFoundError as e:
+        #     missing = "srun" if use_srun else "bash"
+        #     return f"[Error] {missing} not found: {e}"
+        # except Exception as e:
+        #     launcher = "srun" if use_srun else "bash"
+        #     return f"[Error] Failed to start {launcher}: {e}"
 
-        stdout_buf = deque(maxlen=200)
-        stderr_buf = deque(maxlen=200)
-        timed_out = False
+        # stdout_buf = deque(maxlen=200)
+        # stderr_buf = deque(maxlen=200)
+        # timed_out = False
 
-        def _truncate_block(text: str, max_lines: int = 20) -> str:
-            """
-            Truncate long text blocks by keeping only the last few lines for the LLM while preserving full logs on disk.
-            """
-            if not text:
-                return text
-            lines = text.splitlines()
-            if len(lines) <= max_lines:
-                return text
-            tail = lines[-max_lines:]
-            truncated = len(lines) - max_lines
-            return "\n".join(tail + [f"...[truncated {truncated} lines, see log for full output]"])
+        # def _truncate_block(text: str, max_lines: int = 20) -> str:
+        #     """
+        #     Truncate long text blocks by keeping only the last few lines for the LLM while preserving full logs on disk.
+        #     """
+        #     if not text:
+        #         return text
+        #     lines = text.splitlines()
+        #     if len(lines) <= max_lines:
+        #         return text
+        #     tail = lines[-max_lines:]
+        #     truncated = len(lines) - max_lines
+        #     return "\n".join(tail + [f"...[truncated {truncated} lines, see log for full output]"])
 
-        with open(log_path, "w", encoding="utf-8") as log_fp:
-            stdout_task = asyncio.create_task(_stream_output(proc.stdout, log_fp, stdout_buf))
-            stderr_task = asyncio.create_task(_stream_output(proc.stderr, log_fp, stderr_buf, prefix="[stderr] "))
+        # with open(log_path, "w", encoding="utf-8") as log_fp:
+        #     stdout_task = asyncio.create_task(_stream_output(proc.stdout, log_fp, stdout_buf))
+        #     stderr_task = asyncio.create_task(_stream_output(proc.stderr, log_fp, stderr_buf, prefix="[stderr] "))
 
-            try:
-                returncode = await asyncio.wait_for(proc.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                print("Process timed out, terminating...")
-                timed_out = True
-                os.killpg(proc.pid, signal.SIGKILL)
-                returncode = await proc.wait()
-            except asyncio.CancelledError:
-                os.killpg(proc.pid, signal.SIGKILL)
-                await proc.wait()
-                raise
-            finally:
-                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        #     try:
+        #         returncode = await asyncio.wait_for(proc.wait(), timeout=timeout)
+        #     except asyncio.TimeoutError:
+        #         print("Process timed out, terminating...")
+        #         timed_out = True
+        #         os.killpg(proc.pid, signal.SIGKILL)
+        #         returncode = await proc.wait()
+        #     except asyncio.CancelledError:
+        #         os.killpg(proc.pid, signal.SIGKILL)
+        #         await proc.wait()
+        #         raise
+        #     finally:
+        #         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
 
-        stdout_tail = "".join(stdout_buf).strip()
-        stderr_tail = "".join(stderr_buf).strip()
-        stdout_tail = _truncate_block(stdout_tail)
+        # stdout_tail = "".join(stdout_buf).strip()
+        # stderr_tail = "".join(stderr_buf).strip()
+        # stdout_tail = _truncate_block(stdout_tail)
 
-        # Remove noisy srun launcher lines before truncating
-        if stderr_tail and use_srun:
-            filtered = [ln for ln in stderr_tail.split("\n") if "srun" not in ln]
-            stderr_tail = "\n".join(filtered)
-            stderr_tail = _truncate_block(stderr_tail)
+        # # Remove noisy srun launcher lines before truncating
+        # if stderr_tail and use_srun:
+        #     filtered = [ln for ln in stderr_tail.split("\n") if "srun" not in ln]
+        #     stderr_tail = "\n".join(filtered)
+        #     stderr_tail = _truncate_block(stderr_tail)
 
-        if timed_out:
-            return f"[Timeout] Exceeded {timeout}s. Logs: {log_path}"
+        # if timed_out:
+        #     return f"[Timeout] Exceeded {timeout}s. Logs: {log_path}"
 
-        if returncode != 0:
-            err_msg = stderr_tail or f"Process exited with code {returncode}"
-            return f"[Error] {err_msg}\nLogs: {log_path}"
+        # if returncode != 0:
+        #     err_msg = stderr_tail or f"Process exited with code {returncode}"
+        #     return f"[Error] {err_msg}\nLogs: {log_path}"
 
-        submission_path = run_dir / "submission.csv"
+        # submission_path = run_dir / "submission.csv"
 
-        if stdout_tail:
-            return f"[Output]\n{stdout_tail}"
-        if stderr_tail:
-            # if no stdout, check if submission.csv was created
-            if submission_path.exists():
-                return f"No stdout, but submission.csv found at {submission_path}. Stderr:\n{stderr_tail}"
-            return f"No stdout and submission.csv not found. Stderr:\n{stderr_tail}"
+        # if stdout_tail:
+        #     return f"[Output]\n{stdout_tail}"
+        # if stderr_tail:
+        #     # if no stdout, check if submission.csv was created
+        #     if submission_path.exists():
+        #         return f"No stdout, but submission.csv found at {submission_path}. Stderr:\n{stderr_tail}"
+        #     return f"No stdout and submission.csv not found. Stderr:\n{stderr_tail}"
 
-        if submission_path.exists():
-            return f"No stdout, but submission.csv found at {submission_path}."
-        return f"No stdout and submission.csv not found."
+        # if submission_path.exists():
+        #     return f"No stdout, but submission.csv found at {submission_path}."
+        # return f"No stdout and submission.csv not found."
 
 
 # Tool registry

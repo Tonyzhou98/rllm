@@ -41,6 +41,11 @@ Code inside those tags runs in Python; keep the tool name `python` and include <
 Current date: """
 
 SYNTHETIC_DATA = True
+MAX_LLM_CALLS = int(os.environ.get("DEEPRESEARCH_MAX_LLM_CALLS", "15"))
+MAX_TIME_S = int(os.environ.get("DEEPRESEARCH_MAX_TIME_S", str(20 * 60)))
+CALL_SERVER_TIMEOUT_S = int(os.environ.get("DEEPRESEARCH_CALL_SERVER_TIMEOUT_S", "1800"))
+PYTHON_TIMEOUT_S = int(os.environ.get("DEEPRESEARCH_PYTHON_TIMEOUT_S", "90"))
+API_JOB_NAME = os.environ.get("DEEPRESEARCH_API_JOB_NAME", "deepresearch_api_job")
 
 
 @hydra.main(config_path="pkg://rllm.trainer.config", config_name="agent_ppo_trainer", version_base=None)
@@ -54,10 +59,14 @@ def main(config):
         workflow_class=DeepResearchWorkflow,
         workflow_args={
             "tools": {
-                "PythonInterpreter": PythonInterpreterTool(),
+                "PythonInterpreter": PythonInterpreterTool(timeout=PYTHON_TIMEOUT_S, job_name=API_JOB_NAME),
                 "Score": score_tool,
             },
             "system_prompt": SYSTEM_PROMPT,
+            "max_llm_calls": MAX_LLM_CALLS,
+            "max_time_s": MAX_TIME_S,
+            "call_server_timeout_s": CALL_SERVER_TIMEOUT_S,
+            "python_timeout_s": PYTHON_TIMEOUT_S,
         },
         config=config,
         train_dataset=train_dataset,
