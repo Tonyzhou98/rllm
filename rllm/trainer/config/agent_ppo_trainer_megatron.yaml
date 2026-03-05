@@ -19,6 +19,7 @@ actor_rollout_ref:
 
 data:
   gen_batch_size: ${mul:${data.train_batch_size},${rllm.rejection_sample.multiplier}}
+  return_multi_modal_inputs: False
 
 rllm:
   agent:
@@ -46,6 +47,7 @@ rllm:
   disable_thinking: False
   accumulate_reasoning: False
   mask_truncated_samples: False
+  filter_token_mismatch: True
   stepwise_advantage:
     enable: False
     mode: broadcast # [broadcast, per_step]
@@ -54,11 +56,25 @@ rllm:
     enable: False
     mask_max_prompt_length_exceeded: True
     mask_max_response_length_exceeded: True
+    mask_env_done: False
     mask_max_turns_exceeded: True
     mask_timeout: True
+    mask_unknown: False
+    mask_error: True
   rejection_sample:
     enable: False
     multiplier: 1
+  sdk:
+    store:
+      path: ~/.rllm/traces.db
+    processing:
+      groupby_key: null
+      traj_name_key: null
+    proxy:
+      host: 127.0.0.1
+      port: 4000
+      mode: subprocess  # external | subprocess
+      admin_token: my-shared-secret
 
 trainer:
   log_episodes: false

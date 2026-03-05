@@ -56,21 +56,41 @@ sleep 5  # ensure all works connect
 
 echo "Starting vllm serve process"
 
-# srun --nodes=1 --ntasks=1 --overlap -w "$head_node" vllm serve /checkpoints/zyhang/algoevolve/algoevolve_qwen3_8b_mle_syn_single_node_filter_timeout/global_step_45/actor/huggingface \
+
+# srun --nodes=1 --ntasks=1 --overlap -w "$head_node" vllm serve /checkpoints/zyhang/algoevolve/algoevolve_qwen3_30b_mle_syn_single_node_filter_timeout/global_step_120/actor/huggingface \
 #   --trust-remote-code \
 #   --seed=1 \
 #   --port 8001 \
-#   --served-model-name "qwen3_8b_serve_finetuned" \
+#   --served-model-name "qwen3_30b_serve_finetuned" \
 #   --tensor-parallel-size=$SLURM_GPUS_PER_TASK \
 #   --gpu-memory-utilization 0.95 \
 #   --enforce-eager
 
 
-srun --nodes=1 --ntasks=1 --overlap -w "$head_node" vllm serve /checkpoints/zyhang/algoevolve/algoevolve_qwen3_8b_mle_sft_single_node/global_step_40/huggingface \
+# srun --nodes=1 --ntasks=1 --overlap -w "$head_node" vllm serve /checkpoints/zyhang/algoevolve/algoevolve_qwen3_30b_mle_syn_single_node_filter_timeout/global_step_80/actor/huggingface \
+#   --trust-remote-code \
+#   --seed=1 \
+#   --port 8001 \
+#   --served-model-name "qwen3_30b_serve_finetuned_step_80" \
+#   --tensor-parallel-size=$SLURM_GPUS_PER_TASK \
+#   --gpu-memory-utilization 0.95 \
+#   --enforce-eager
+
+
+srun --nodes=1 --ntasks=1 --overlap -w "$head_node" vllm serve /checkpoints/zyhang/algoevolve/algoevolve_qwen3_30b_mle_syn_single_node_filter_timeout/global_step_60/actor/huggingface \
   --trust-remote-code \
   --seed=1 \
   --port 8001 \
-  --served-model-name "qwen3_8b_serve_finetuned" \
+  --served-model-name "qwen3_30b_serve_finetuned_step_60" \
   --tensor-parallel-size=$SLURM_GPUS_PER_TASK \
   --gpu-memory-utilization 0.95 \
   --enforce-eager
+
+# srun --nodes=1 --ntasks=1 --overlap -w "$head_node" vllm serve /checkpoints/zyhang/algoevolve/algoevolve_qwen3_30b_mle_sft_single_node/global_step_80/huggingface \
+#   --trust-remote-code \
+#   --seed=1 \
+#   --port 8001 \
+#   --served-model-name "qwen3_30b_serve_finetuned_sft" \
+#   --tensor-parallel-size=$SLURM_GPUS_PER_TASK \
+#   --gpu-memory-utilization 0.95 \
+#   --enforce-eager

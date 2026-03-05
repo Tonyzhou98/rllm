@@ -134,7 +134,8 @@ class ChatTemplateParser:
                 stripped.append(new_msg)
             return stripped
 
-        prompt = self.parse(strip_think_blocks(messages[:last_assistant_idx]), is_first_msg=True, add_generation_prompt=True, accumulate_reasoning=False)
+        # prompt = self.parse(strip_think_blocks(messages[:last_assistant_idx]), is_first_msg=True, add_generation_prompt=True, accumulate_reasoning=False)
+        prompt = self.parse(messages[:last_assistant_idx], is_first_msg=True, add_generation_prompt=True, accumulate_reasoning=False)
         prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
 
         response = self.parse([messages[last_assistant_idx]], is_first_msg=False, add_generation_prompt=False, accumulate_reasoning=True)
@@ -163,7 +164,7 @@ class ChatTemplateParser:
         for i in range(first_assistant_idx, len(messages)):
             is_asst = messages[i]["role"] == "assistant"
             if is_asst:
-                response = self.parse([messages[i]], is_first_msg=False, add_generation_prompt=False, accumulate_reasoning=True)
+                response = self.parse([messages[i]], is_first_msg=False, add_generation_prompt=False, accumulate_reasoning=False)
                 response = response[len(self.generation_prompt) :]
                 ids = self.tokenizer.encode(response, add_special_tokens=False)
                 response_ids.extend(ids)

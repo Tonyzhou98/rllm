@@ -7,9 +7,9 @@
 #SBATCH --gpus-per-node 8
 #SBATCH --mem 500G
 #SBATCH --time=48:00:00
-#SBATCH --job-name=mle_syn_qwen3_8b_rl_grpo_agent_single_node_median_reward
-#SBATCH --output=/fsx/zyhang/rllm/examples/deepresearch/slurm/mle_syn_qwen3_8b_rl_grpo_agent_single_node_median_reward.stdout
-#SBATCH --error=/fsx/zyhang/rllm/examples/deepresearch/slurm/mle_syn_qwen3_8b_rl_grpo_agent_single_node_median_reward.stderr
+#SBATCH --job-name=mle_syn_qwen3_8b_rl_grpo_agent_single_node_filter_timeout
+#SBATCH --output=/fsx/zyhang/rllm/examples/deepresearch/slurm/mle_syn_qwen3_8b_rl_grpo_agent_single_node_filter_timeout.stdout
+#SBATCH --error=/fsx/zyhang/rllm/examples/deepresearch/slurm/mle_syn_qwen3_8b_rl_grpo_agent_single_node_filter_timeout.stderr
 
 
 set -x
@@ -21,13 +21,13 @@ export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
 
-export SRUN_API_URL="http://10.136.114.209:9000"
+export SRUN_API_URL="http://10.136.50.90:9000"
 
 # Find the directory where rllm package is located
 CHECKPOINT_PATH=/checkpoints/zyhang
 DATA_PATH=/fsx/zyhang/rllm/data/datasets
 project_name="algoevolve"
-experiment_name="algoevolve_qwen3_8b_mle_syn_single_node_median_reward"
+experiment_name="algoevolve_qwen3_8b_mle_syn_single_node_filter_timeout"
 
 run_root=/fsx/zyhang/rllm/examples/deepresearch/output
 ts=$(date +%Y%m%d-%H%M%S)
@@ -73,15 +73,16 @@ PYTHONUNBUFFERED=1 bash -c "python3 -m examples.deepresearch.custom_train \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
-    rllm.compact_filtering.enable=False \
+    rllm.compact_filtering.enable=True \
     rllm.compact_filtering.mask_max_prompt_length_exceeded=False \
     rllm.compact_filtering.mask_max_response_length_exceeded=False \
     rllm.compact_filtering.mask_max_turns_exceeded=False \
-    rllm.compact_filtering.mask_timeout=False \
+    rllm.compact_filtering.mask_timeout=True \
+    rllm.compact_filtering.mask_unknown=True \
     actor_rollout_ref.actor.entropy_coeff=0 \
     rllm.mask_truncated_samples=False \
     trainer.critic_warmup=0 \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.logger=['console','wandb'] \
     trainer.project_name=${project_name} \
     trainer.experiment_name=${experiment_name} \

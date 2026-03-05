@@ -1,9 +1,7 @@
 import os
-from pathlib import Path
 
 import hydra
 from rllm.trainer.agent_trainer import AgentTrainer
-from rllm.data.dataset import DatasetRegistry
 from .deepresearch_tools import PythonInterpreterTool, ScoreTool, SynScoreTool
 from .deepresearch_workflow import DeepResearchWorkflow
 
@@ -48,9 +46,8 @@ PYTHON_TIMEOUT_S = int(os.environ.get("DEEPRESEARCH_PYTHON_TIMEOUT_S", "90"))
 API_JOB_NAME = os.environ.get("DEEPRESEARCH_API_JOB_NAME", "deepresearch_api_job")
 
 
-@hydra.main(config_path="pkg://rllm.trainer.config", config_name="agent_ppo_trainer", version_base=None)
+@hydra.main(config_path="pkg://rllm.trainer.config", config_name="agent_ppo_trainer_megatron", version_base=None)
 def main(config):
-    dataset_name = "mle_bench_syn" if SYNTHETIC_DATA else "mle_bench"
     score_tool = SynScoreTool() if SYNTHETIC_DATA else ScoreTool()
     trainer = AgentTrainer(
         workflow_class=DeepResearchWorkflow,

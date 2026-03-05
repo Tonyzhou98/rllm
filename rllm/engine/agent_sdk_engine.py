@@ -644,9 +644,16 @@ class AgentSdkEngine:
         cf = self.config.rllm.compact_filtering
         is_valid = [True] * len(episode_ids)
         if cf.enable:
+            mask_max_prompt_length_exceeded = bool(cf.get("mask_max_prompt_length_exceeded", False))
+            mask_max_response_length_exceeded = bool(cf.get("mask_max_response_length_exceeded", False))
+            mask_env_done = bool(cf.get("mask_env_done", False))
+            mask_max_turns_exceeded = bool(cf.get("mask_max_turns_exceeded", False))
+            mask_timeout = bool(cf.get("mask_timeout", False))
+            mask_unknown = bool(cf.get("mask_unknown", False))
+            mask_error = bool(cf.get("mask_error", False))
             for i in range(len(episode_ids)):
                 termination_reason = termination_reasons[i]
-                if (cf.mask_max_prompt_length_exceeded and termination_reason == TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED) or (cf.mask_max_response_length_exceeded and termination_reason == TerminationReason.MAX_RESPONSE_LENGTH_EXCEEDED) or (cf.mask_env_done and termination_reason == TerminationReason.ENV_DONE) or (cf.mask_max_turns_exceeded and termination_reason == TerminationReason.MAX_TURNS_EXCEEDED) or (cf.mask_timeout and termination_reason == TerminationReason.TIMEOUT) or (cf.mask_unknown and termination_reason == TerminationReason.UNKNOWN) or (cf.mask_error and termination_reason == TerminationReason.ERROR):
+                if (mask_max_prompt_length_exceeded and termination_reason == TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED) or (mask_max_response_length_exceeded and termination_reason == TerminationReason.MAX_RESPONSE_LENGTH_EXCEEDED) or (mask_env_done and termination_reason == TerminationReason.ENV_DONE) or (mask_max_turns_exceeded and termination_reason == TerminationReason.MAX_TURNS_EXCEEDED) or (mask_timeout and termination_reason == TerminationReason.TIMEOUT) or (mask_unknown and termination_reason == TerminationReason.UNKNOWN) or (mask_error and termination_reason == TerminationReason.ERROR):
                     is_valid[i] = False  # set flag to filter out the episode later (after advantages are computed)
 
         # Build tensors dict, conditionally include rollout_log_probs if available

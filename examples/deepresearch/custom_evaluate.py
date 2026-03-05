@@ -8,8 +8,8 @@ from pathlib import Path
 from rllm.engine.agent_workflow_engine import AgentWorkflowEngine
 from rllm.engine.rollout import OpenAIEngine
 
-from deepresearch_tools import PythonInterpreterTool, ScoreTool, SynScoreTool
-from deepresearch_workflow import DeepResearchWorkflow
+from .deepresearch_tools import PythonInterpreterTool, ScoreTool, SynScoreTool
+from .deepresearch_workflow import DeepResearchWorkflow
 
 SYSTEM_PROMPT = """You are an expert Kaggle competitor. Produce one Python script that trains a model and writes `submission.csv` for the dataset in the user prompt.
 
@@ -107,7 +107,7 @@ def load_task_description(competition_id: str, data_root: Path) -> str:
     if not competition_path.exists():
         raise FileNotFoundError(f"Competition data path does not exist: {competition_path}")
 
-    print(f"Using competition data path: {competition_path}")
+    # print(f"Using competition data path: {competition_path}")
     description_file = competition_path / "description.md"
     if not description_file.exists():
         raise FileNotFoundError(f"description.md not found for competition: {competition_id}")
@@ -117,12 +117,14 @@ def load_task_description(competition_id: str, data_root: Path) -> str:
     files_list = []
     for entry in entries:
         name = entry.name
+        if "zip" in name:
+            continue
         if entry.is_dir():
             files_list.append(f"- **{competition_path / name}/**")
         else:
             files_list.append(f"- **{competition_path / name}**")
     files_section = f"## Files Provided in **{str(competition_path)}**:\n" + "\n".join(files_list)
-    print("Files in competition folder:\n", files_section)
+    # print("Files in competition folder:\n", files_section)
 
     return f"{specific_task_description}\n\n{files_section}"
 
@@ -138,7 +140,7 @@ def build_tasks(competition_ids: list[str], data_root: Path, args: argparse.Name
             .replace("{data_root}", str(data_root))
         )
         tasks.append(
-            {"question": user_prompt_template.replace("{specific_task_description}", specific_prompt).replace("1 min", f"{args.python_timeout_s} seconds")}
+            {"question": user_prompt_template.replace("{specific_task_description}", specific_prompt)}
         )
     return tasks
 
@@ -182,6 +184,38 @@ def setup_output_directory(model_name: str) -> Path:
     return run_dir
 
 
+def _episode_output_dir(episode, fallback_dir: Path) -> Path:
+    """Pick the output directory for an episode (submission folder if available)."""
+    submission_path = None
+    try:
+        submission_path = episode.metrics.get("submission_path")
+    except Exception:
+        submission_path = None
+
+    if submission_path:
+        try:
+            return Path(str(submission_path)).resolve().parent
+        except Exception:
+            pass
+
+    return fallback_dir
+
+
+def _episode_filename(episode, suffix: str = ".json") -> str:
+    episode_id = getattr(episode, "id", "") or "episode"
+    competition_id = _extract_competition_id_from_task(episode.task)
+    return f"{_slugify(competition_id)}_{_slugify(str(episode_id))}{suffix}"
+
+
+def save_episode_to_disk(episode, fallback_dir: Path) -> Path:
+    """Serialize an episode to JSON next to its submission.csv (or fallback)."""
+    output_dir = _episode_output_dir(episode, fallback_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / _episode_filename(episode)
+    output_path.write_text(json.dumps(episode.to_dict(), indent=2), encoding="utf-8")
+    return output_path
+
+
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for model selection and runtime configuration."""
     parser = argparse.ArgumentParser(description="Run DeepResearch custom evaluation over Kaggle tasks.")
@@ -197,10 +231,16 @@ def parse_args() -> argparse.Namespace:
         help="Number of parallel tasks to run.",
     )
     parser.add_argument(
-        "--synthetic",
-        action="store_true",
-        default=False,
-        help="Use synthetic dataset from /fsx/zyhang/mle-bench-syn and SynScoreTool.",
+        "--dataset",
+        choices=["easy", "hard", "synthetic", "synthetic_sampled"],
+        default="easy",
+        help=(
+            "Dataset selection: "
+            "'easy' uses the true dataset with the fixed competition id list; "
+            "'hard' uses all subfolders under /fsx/zyhang/mle-bench-data excluding those competition ids "
+            "(prints the excluded ids); "
+            "'synthetic' uses /fsx/zyhang/mle-bench-syn with SynScoreTool."
+        ),
     )
     parser.add_argument(
         "--max-llm-calls",
@@ -239,28 +279,44 @@ def create_rollout_engine(model: str) -> OpenAIEngine:
     """Helper to create the rollout engine with the desired base model."""
     resolved_api_key = os.environ.get("OPENROUTER_API_KEY")
 
-    if "claude" in model:
+    if "claude" in model or "deepseek" in model or "gpt" in model or "gemini" in model:
         return OpenAIEngine(model=model, api_key=resolved_api_key, base_url="https://openrouter.ai/api/v1")
-    elif "qwen" in model:
-        return OpenAIEngine(model="qwen3_8b_serve", api_key="None", base_url="http://h200-011-039:8001/v1")
+    elif "qwen3-8b-base" in model:
+        return OpenAIEngine(model="qwen3_8b_serve", api_key="None", base_url="http://h200-038-112:8001/v1")
+    elif "qwen3-14b-base" in model:
+        return OpenAIEngine(model="qwen3_14b_serve", api_key="None", base_url="http://h200-054-076:8001/v1")
+    elif "qwen3-30b-base" in model:
+        return OpenAIEngine(model="qwen3_30b_serve", api_key="None", base_url="http://h200-007-063:8001/v1")
+    elif model == "qwen3-30b-finetuned":
+        return OpenAIEngine(model="qwen3_30b_serve_finetuned", api_key="None", base_url="http://h200-011-039:8001/v1")
+    elif model == "qwen3-30b-finetuned-step-80":
+        return OpenAIEngine(model="qwen3_30b_serve_finetuned_step_80", api_key="None", base_url="http://h200-055-071:8001/v1")
+    elif model == "qwen3-30b-finetuned-sft":
+        return OpenAIEngine(model="qwen3_30b_serve_finetuned_sft", api_key="None", base_url="http://h200-003-126:8001/v1")
+    elif "qwen3-8b-finetuned" in model:
+        return OpenAIEngine(model="qwen3_8b_serve_finetuned", api_key="None", base_url="http://h200-015-228:8001/v1")
+    elif "qwen3-14b-finetuned" in model:
+        return OpenAIEngine(model="qwen3_14b_serve_finetuned", api_key="None", base_url="http://h200-002-221:8001/v1")
     else:
         raise ValueError(f"Unsupported model specified: {model}")
 
 async def main():
     args = parse_args()
     run_dir = setup_output_directory(args.model)
-    data_root = Path("/fsx/zyhang/mle-bench-syn" if args.synthetic else "/fsx/zyhang/mle-bench-data")
+    data_root = Path("/fsx/zyhang/mle-bench-syn" if "synthetic" in args.dataset else "/fsx/zyhang/mle-bench-data")
     print("Data root:", data_root)
 
     engine = create_rollout_engine(model=args.model)
-    score_tool = SynScoreTool() if args.synthetic else ScoreTool()
+    score_tool = SynScoreTool() if "synthetic" in args.dataset else ScoreTool()
+    job_name = os.environ.get("DEEPRESEARCH_API_JOB_NAME", "deepresearch_api_job")
+    print("Using job name:", job_name)
     workflow_engine = AgentWorkflowEngine(
         workflow_cls=DeepResearchWorkflow,
         workflow_args={
             "tools": {
                 "PythonInterpreter": PythonInterpreterTool(
                     timeout=args.python_timeout_s,
-                    job_name=os.environ.get("DEEPRESEARCH_API_JOB_NAME", "deepresearch_api_job"),
+                    job_name=job_name,
                 ),
                 "Score": score_tool,
             },
@@ -276,8 +332,12 @@ async def main():
         n_parallel_tasks=args.parallel_tasks,
     )
 
-    if args.synthetic:
-        ok_list_path = Path("/fsx/zyhang/AlgoEvolve/syn_data/ok_competitions_sanity.json")
+    if "synthetic" in args.dataset:
+
+        if args.dataset == "synthetic":
+            ok_list_path = Path("/fsx/zyhang/AlgoEvolve/syn_data/ok_competitions_sanity.json")
+        elif args.dataset == "synthetic_sampled":
+            ok_list_path = Path("/fsx/zyhang/AlgoEvolve/syn_data/ok_competitions_sanity_random_64.json")
         ok_candidates = json.loads(ok_list_path.read_text(encoding="utf-8"))
         if not isinstance(ok_candidates, list):
             raise ValueError(f"Expected list in {ok_list_path}")
@@ -287,6 +347,17 @@ async def main():
             if not entry.is_dir():
                 continue
             if entry.name not in ok_candidates:
+                continue
+            if (entry / "prepared" / "public" / "description.md").exists():
+                competition_ids.append(entry.name)
+    elif args.dataset == "hard":
+        excluded = set(competition_id_list)
+        print("Hard dataset: excluding competition ids:", sorted(excluded))
+        competition_ids = []
+        for entry in sorted(data_root.iterdir()):
+            if not entry.is_dir():
+                continue
+            if entry.name in excluded:
                 continue
             if (entry / "prepared" / "public" / "description.md").exists():
                 competition_ids.append(entry.name)
@@ -300,7 +371,7 @@ async def main():
     tasks = build_tasks(repeated_competition_ids, data_root, args)
     summaries = []
     reward_distributions: dict[str, list] = {}
-    batch_size = 32 * repeat_times
+    batch_size = 128 * repeat_times
     for i in range(0, len(tasks), batch_size):
         batch_tasks = tasks[i : i + batch_size]
         batch_start = i
@@ -332,6 +403,7 @@ async def main():
                         }
                     )
                     reward_distributions.setdefault(competition_id, []).append(reward_value)
+                    save_episode_to_disk(episode, fallback_dir=run_dir)
             output_path.write_text(json.dumps(summaries, indent=2), encoding="utf-8")
 
     reward_output_path = run_dir / "reward_distributions.json"

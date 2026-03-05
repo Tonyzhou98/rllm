@@ -731,7 +731,7 @@ class ScoreTool(DeepResearchTool):
         output_dir = Path(run_dir) if run_dir else Path(os.environ.get("DEEPRESEARCH_OUTPUT_DIR", Path.cwd()))
         submission_path = Path(path) if path else output_dir / "submission.csv"
         if not submission_path.exists():
-            return f"[Error] submission file not found at {submission_path}"
+            return f"[Error] submission file not found at {submission_path}. Please revise your Python code to generate submission.csv."
 
         cmd = [
             "mlebench",
@@ -791,8 +791,14 @@ class ScoreTool(DeepResearchTool):
 
         # Build human-friendly prefix when score is missing; surface grader output directly
         if score is None:
-            return f"Submission csv is invalid. Detailed issue: {output}"
-
+            return f"Submission csv is invalid. Please compare your submission.csv with sample_submission.csv and then revise your Python code to re-generate another submission.csv file. Detailed issue: {output}"
+        
+        if metrics["metric_lower_is_better (true means lower score is better)"]:
+            if score > metrics["threshold_bronze (score needed for bronze tier)"]:
+                return f"Submission OK. But you do not reach the bronze threshold to get the medal. Please revise your Python code to improve your score. Details: {json.dumps(metrics)}"
+        else:
+            if score < metrics["threshold_bronze (score needed for bronze tier)"]:
+                return f"Submission OK. But you do not reach the bronze threshold to get the medal. Please revise your Python code to improve your score. Details: {json.dumps(metrics)}"
         return f"Submission OK. Details: {json.dumps(metrics)}"
 
 
@@ -822,12 +828,8 @@ class SynScoreTool(DeepResearchTool):
         evaluator_path = Path("/fsx/zyhang/mle-bench-syn") / competition_id / "prepared" / "public" / "evaluator.py"
         evaluator_dir = evaluator_path.parent
 
-        if submission_path != output_dir / "submission.csv":
-            return f"[Error] submission.csv must be located at {output_dir / 'submission.csv'}"
-        if not evaluator_path.exists():
-            return f"[Error] evaluator.py not found at {evaluator_path}"
         if not submission_path.exists():
-            return f"[Error] submission file not found at {submission_path}"
+            return f"[Error] submission file not found at {submission_path}. Please revise your Python code to generate submission.csv."
 
         cmd = ["python", "evaluator.py", "--submission_path", str(submission_path)]
 
@@ -851,7 +853,7 @@ class SynScoreTool(DeepResearchTool):
 
         if eval_proc.returncode != 0:
             output = "\n".join([line for line in [stderr, stdout] if line])
-            return f"[Error] Evaluation failed with code {eval_proc.returncode}: {output}"
+            return f"Submission csv is invalid. Please revise your Python code to re-generate another submission.csv file. Detailed issue: {output}"
 
         try:
             data = json.loads(stdout)
@@ -894,7 +896,27 @@ class SynScoreTool(DeepResearchTool):
 
         if score is None:
             output = "\n".join([line for line in [stderr, stdout] if line])
-            return f"Submission csv is invalid. Detailed issue: {output}"
+            return (
+                "Submission csv is invalid. Please revise your Python code to re-generate another submission.csv file. "
+                f"Detailed issue: {output}"
+            )
+
+        if is_lower_better:
+            if metrics["threshold_bronze (score needed for bronze tier)"] is not None and score > metrics[
+                "threshold_bronze (score needed for bronze tier)"
+            ]:
+                return (
+                    "Submission OK. But you do not reach the bronze threshold to get the medal. "
+                    f"Please revise your Python code to improve your score. Details: {json.dumps(metrics)}"
+                )
+        else:
+            if metrics["threshold_bronze (score needed for bronze tier)"] is not None and score < metrics[
+                "threshold_bronze (score needed for bronze tier)"
+            ]:
+                return (
+                    "Submission OK. But you do not reach the bronze threshold to get the medal. "
+                    f"Please revise your Python code to improve your score. Details: {json.dumps(metrics)}"
+                )
 
         return f"Submission OK. Details: {json.dumps(metrics)}"
 

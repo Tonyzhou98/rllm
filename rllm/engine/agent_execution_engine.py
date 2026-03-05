@@ -485,7 +485,15 @@ class AgentExecutionEngine:
         response_tokens = torch.tensor(response_tokens, dtype=torch.long)
         response_masks = torch.tensor(response_masks, dtype=torch.long)
 
-        if self.config.rllm.filter_token_mismatch:
+        # Backward-compatible config access: older configs may not define
+        # rllm.filter_token_mismatch.
+        filter_token_mismatch = False
+        if self.config is not None:
+            rllm_cfg = self.config.get("rllm", {})
+            if rllm_cfg is not None:
+                filter_token_mismatch = rllm_cfg.get("filter_token_mismatch", False)
+
+        if filter_token_mismatch:
             response_masks = response_masks * int(is_valid_trajectory)
 
         return prompt_tokens, response_tokens, response_masks, is_valid_trajectory

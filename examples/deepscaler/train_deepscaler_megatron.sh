@@ -1,16 +1,33 @@
 #!/bin/bash
+
+#SBATCH --chdir=/fsx/zyhang/rllm/
+#SBATCH --nodes 1 
+#SBATCH --tasks-per-node 8 
+#SBATCH --cpus-per-task 24 
+#SBATCH --gpus-per-node 8
+#SBATCH --mem 1000G
+#SBATCH --time=96:00:00
+#SBATCH --job-name=deepscaler_qwen3_8b_megatron_rl_grpo_agent_single_node
+#SBATCH --output=/fsx/zyhang/rllm/examples/deepscaler/slurm/deepscaler_qwen3_8b_megatron_rl_grpo_agent_single_node_filter_timeout.stdout
+#SBATCH --error=/fsx/zyhang/rllm/examples/deepscaler/slurm/deepscaler_qwen3_8b_megatron_rl_grpo_agent_single_node_filter_timeout.stderr
+
 set -x
 
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export VLLM_USE_V1=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
+# Avoid vLLM TP startup failures on shared/overlapped GPU rank mappings.
+# In vLLM 0.11.0, symmetric-memory allreduce is enabled by default.
+export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+export VLLM_USE_NCCL_SYMM_MEM=0
 
 # Find the directory where rllm package is located
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
 
 
-MODEL_PATH=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+MODEL_PATH=/fsx/zyhang/Qwen/Qwen3-8B
+DATA_PATH=/fsx/zyhang/rllm/data/datasets
 
 gen_tp=2     
 train_tp=2   
@@ -24,6 +41,8 @@ python -m examples.deepscaler.train_deepscaler_megatron \
     data.val_batch_size=30 \
     data.max_prompt_length=2048 \
     data.max_response_length=24576 \
+    data.train_files=$DATA_PATH/deepscaler_math/train_verl.parquet \
+    data.val_files=$DATA_PATH/aime2024/test_verl.parquet \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.hybrid_engine=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \

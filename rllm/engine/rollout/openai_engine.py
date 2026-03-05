@@ -64,8 +64,11 @@ class OpenAIEngine(RolloutEngine):
         retries = self.api_retries
         while retries > 0:
             try:
-                response = await self.client.chat.completions.create(model=self.model, messages=messages, timeout=3600, **create_params, **sampling_params)
-
+                if "claude" in self.model.lower():
+                    response = await self.client.chat.completions.create(model=self.model, messages=messages, timeout=3600, extra_body={"reasoning": {"enabled": True}}, **create_params, **sampling_params)
+                else:
+                    response = await self.client.chat.completions.create(model=self.model, messages=messages, timeout=3600, **create_params, **sampling_params)
+                
                 content = response.choices[0].message.content
                 reasoning = response.choices[0].message.reasoning if hasattr(response.choices[0].message, "reasoning") and isinstance(response.choices[0].message.reasoning, str) else ""
                 tool_calls = response.choices[0].message.tool_calls if hasattr(response.choices[0].message, "tool_calls") and isinstance(response.choices[0].message.tool_calls, list) else []

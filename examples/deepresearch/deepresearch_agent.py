@@ -356,6 +356,9 @@ class MultiTurnReactAgent:
             ModelOutput with text and tool_calls
         """
         try:
+            # print("""\n[DeepResearch] Calling model with messages:""")
+            # print(messages)
+            # print("=" * 50)
             api_params = {"messages": messages, "enforce_max_prompt_length": False}
             task = asyncio.create_task(self.rollout_engine.get_model_response(**api_params))
             try:
@@ -548,7 +551,7 @@ class MultiTurnReactAgent:
             print(f"{self.competition_id}: [DeepResearch] Round {round} LLM call completed.")
             if response is None:
                 prediction = "No answer found due to call_server timeout/None response"
-                termination = f"timeout"
+                termination = "timeout"
                 print(f"{self.competition_id}: [DeepResearch] call_server returned None or timed out.")
                 messages = self._append_output_tag(messages)
                 result = {
@@ -705,34 +708,54 @@ class MultiTurnReactAgent:
             #         messages.extend(tool_responses)
 
             # Priority 2: Check for ReAct text format (gpt-4o, Claude)
-            if "<tool_call>" in content and "</tool_call>" in content:
+            if "<tool_call>" in content:
                 # ReAct text format path
                 messages.append({"role": "assistant", "content": content.strip()})
 
-                tool_call_text = content.split("<tool_call>")[1].split("</tool_call>")[0]
+                if "</tool_call>" not in content:
+                    tool_call_text = content.split("<tool_call>")[1].replace("<think>", "").replace("</think>", "").strip()
+                else:
+                    tool_call_text = content.split("<tool_call>")[1].split("</tool_call>")[0].strip()
                 try:
                     # Special handling for Python code (match original logic)
                     if "python" in tool_call_text.lower() or "<code>" in tool_call_text.lower():
                         try:
                             # Extract code from the original content (not just tool_call_text)
-                            code_blocks = re.findall(r"<code>(.*?)</code>", content, flags=re.DOTALL | re.IGNORECASE)
-                            if not code_blocks:
-                                raise ValueError("No <code> blocks found in tool call.")
+
+                            if "<code>" in content and "</code>" in content:
+                                code_blocks = re.findall(r"<code>(?!.*<code>)(.*?)</code>", content, flags=re.DOTALL | re.IGNORECASE)
+                                if not code_blocks:
+                                    code_blocks = re.findall(r"<code>(.*?)</code>", content, flags=re.DOTALL | re.IGNORECASE)
+                            elif "<code>" in content and "</code>" not in content:
+                                code_blocks = [content.split("<code>")[1].strip()]
+                            else:
+                                code_blocks = [tool_call_text.replace("python", "").strip()]
+                            
                             merged_code = "\n\n".join(block.strip() for block in code_blocks if block.strip())
+                            merged_code = merged_code.replace("<code>", "").replace("</code>", "").replace("<tool_call>", "").replace("</tool_call>", "").replace("<think>", "").replace("</think>", "")
+                            # print(f"{self.competition_id}: [DeepResearch] Round {round}: 🐍 Executing Python code:\n{content}")
+                            # if "<code>" in merged_code:
+                            #     merged_code = merged_code.split("<code>")[1].split("</code>")[0].strip()
+
+                            exec_start = time.time()
                             result = await self.execute_python(merged_code)
+                            exec_elapsed = time.time() - exec_start
                             # print(f"{self.competition_id}: [DeepResearch] Round {round}: 🐍 Executed Python code result: {str(result)}")
-                            print(f"{self.competition_id}: [DeepResearch] Round {round}: 🐍 Python execution finished")
-                        except Exception:
+                            print(f"{self.competition_id}: [DeepResearch] Round {round}: 🐍 Python execution finished in {exec_elapsed:.2f}s")
+                        except Exception as e:
+                            print(f"{self.competition_id}: [DeepResearch] Round {round}: Error executing Python code. Error: {e}, code: {content}")
                             result = "[Python Interpreter Error]: Formatting error. You must wrap your code within <code></code> tags."
                     else:
                         # Parse JSON tool call
                         tool_call = json5.loads(tool_call_text)
                         tool_name = tool_call.get("name", "")
                         tool_args = tool_call.get("arguments", {})
+                        # print(f"{self.competition_id}: "f"[DeepResearch] Round {round}: 🔧 Calling {tool_name} Content: {content}")
                         result = await self.custom_call_tool(tool_name, tool_args)
                         print(f"{self.competition_id}: [DeepResearch] Round {round}: 🛠️ Tool {tool_name} returned: {str(result)}")
 
-                except Exception:
+                except Exception as e:
+                    print(f"{self.competition_id}: [DeepResearch] Round {round}: Error parsing tool call JSON. Error: {e}, tool_call_text: {tool_call_text}")
                     result = 'Error: Tool call is not a valid JSON. Tool call must contain a valid "name" and "arguments" field.'
 
                 # Add tool response in ReAct format

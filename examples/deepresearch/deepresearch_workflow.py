@@ -127,13 +127,13 @@ class DeepResearchWorkflow(Workflow):
             episode = self._convert_to_episode(result, task, uid, score_metrics=score_metrics)
 
             competition_id = self._extract_competition_id(question) or "unknown"
-            print(f"✅ DeepResearch workflow completed for task {competition_id}")
+            print(f"✅ DeepResearch workflow completed for task {competition_id}, termination_reason: {episode.termination_reason}")
             # print(f"   Prediction: {result.get('prediction', 'No prediction')}")
 
             return episode
 
         except Exception as e:
-            # print(f"❌ DeepResearch workflow failed for task {uid}: {e}")
+            print(f"❌ DeepResearch workflow failed for task {uid}: {e}")
 
             # Create a failed episode
             episode = Episode()
@@ -192,15 +192,17 @@ class DeepResearchWorkflow(Workflow):
         try:
             run_dir = messages[-1].get("content", "")
             run_dir = run_dir.split("<output>", 1)[1].split("</output>", 1)[0].strip()
-            print(f"   Running ScoreTool fallback on run_dir: {run_dir}")
+            output_dir = Path(run_dir)
+            submission_path = output_dir / "submission.csv"
             if run_dir is None:
                 # print("⚠️  No output directory found in conversation for ScoreTool fallback.")
-                return {}
+                return {"submission_path": str(submission_path)}
             result = await score_tool.call(competition_id=competition_id, run_dir=run_dir)
+            print("✅ ScoreTool fallback executed. Results:", result)
             return self._extract_score_metrics([{"role": "tool", "content": result}])
         except Exception as e:
             # print(f"⚠️  ScoreTool fallback failed: {e}")
-            return {}
+            return {"submission_path": str(submission_path)}
 
     def _extract_competition_id(self, question: str) -> str | None:
         """Extract competition id from the task prompt."""
@@ -225,7 +227,7 @@ class DeepResearchWorkflow(Workflow):
         total_steps = max(1, len(trajectory.steps))
         return count, count / total_steps
 
-    def _score_to_reward(self, metrics: dict, error_count: int, error_rate: float, message_count: int, format_correct_rate: float) -> tuple[float, dict]:
+    def _score_to_reward(self, metrics: dict, message_count: int, format_correct_rate: float) -> tuple[float, dict]:
         """
         Convert ScoreTool metrics into a scalar reward.
         - Uses score_primary and metric_lower_is_better.
@@ -247,15 +249,46 @@ class DeepResearchWorkflow(Workflow):
         #         if score < median_score:
         #             score = None  # Treat worse-than-median as no score
 
-
+        valid_submission = False
         if score is not None:
+            reward += 0.2 # Base reward for having a score
+            valid_submission = True
             try:
                 score_val = float(score)
+                median_score = float(metrics.get("threshold_median (median submission score)"))
+                bronze_score = float(metrics.get("threshold_bronze (score needed for bronze tier)"))
+                silver_score = float(metrics.get("threshold_silver (score needed for silver tier)"))
+                gold_score = float(metrics.get("threshold_gold (score needed for gold tier)"))
+
                 if lower_is_better:
-                    score_val = max(score_val, 0.0)
-                    reward = 0.7 * (1.0 / (1.0 + math.log1p(score_val)))
+                    # Better if lower
+                    if score_val <= gold_score:
+                        reward += 0.7
+                    elif score_val <= silver_score:
+                        reward += 0.6
+                    elif score_val <= bronze_score:
+                        reward += 0.5
+                    elif score_val <= median_score:
+                        reward += 0.1
+                    else:
+                        reward += 0.0
                 else:
-                    reward = 0.7 * math.log1p(max(score_val, 0.0))
+                    # Better if higher
+                    if score_val >= gold_score:
+                        reward += 0.7
+                    elif score_val >= silver_score:
+                        reward += 0.6
+                    elif score_val >= bronze_score:
+                        reward += 0.5
+                    elif score_val >= median_score:
+                        reward += 0.1
+                    else:
+                        reward += 0.0
+                # if lower_is_better:
+                #     score_val = max(score_val, 0.0)
+                #     reward = 0.7 * (1.0 / (1.0 + math.log1p(score_val)))
+                # else:
+                #     reward = 0.7 * math.log1p(max(score_val, 0.0))
                 
                 # Light penalties for noisy/long runs
                 # reward -= 0.02 * error_rate  # scaled by rate
@@ -273,7 +306,8 @@ class DeepResearchWorkflow(Workflow):
                     submission_bonus = 0.2
             except Exception:
                 submission_bonus = 0.0
-        reward += submission_bonus
+        
+        # reward += submission_bonus
 
         # Clamp to keep extremes bounded
         reward = max(min(reward, 1e3), -1e3)
@@ -282,11 +316,10 @@ class DeepResearchWorkflow(Workflow):
             "reward_raw": reward,
             "score_primary": score,
             "metric_lower_is_better": lower_is_better,
-            "error_count": error_count,
-            "error_rate": error_rate,
             "message_count": message_count,
             "format_correct_rate": format_correct_rate,
             "submission_bonus": submission_bonus,
+            "valid_submission": valid_submission,
         }
         return reward, extra
 
@@ -328,13 +361,10 @@ class DeepResearchWorkflow(Workflow):
         prediction = result.get("prediction", "")
         score_metrics = score_metrics or self._extract_score_metrics(messages)
 
-        error_count, error_rate = self._count_errors(trajectory)
         message_count = len(messages)
         format_correct_rate = self._format_correct_rate(messages)
         reward_value, reward_details = self._score_to_reward(
             score_metrics,
-            error_count,
-            error_rate,
             message_count,
             format_correct_rate,
         )
@@ -369,9 +399,23 @@ class DeepResearchWorkflow(Workflow):
 
         # For our Kaggle-style tasks, correctness is tied to reward from ScoreTool
         is_correct = True if score_metrics else False
+        error_count, error_rate = self._count_errors(trajectory)
 
         # Map termination reason
         termination_reason = self._map_termination_reason(result.get("termination", "unknown"))
+
+        # Check for excessive timeouts in tool responses
+        tool_response_msgs = [msg for msg in messages if msg.get("role") == "user" and "<tool_response>" in msg.get("content", "")]
+        timeout_msg_number = 0
+        for m in messages:
+            if m['role'] == "user" and "<tool_response>" in m['content']:
+                content = m['content']
+                if "Python execution timed out" in content:
+                    timeout_msg_number += 1
+        
+        if len(tool_response_msgs) > 0 and float(timeout_msg_number) / len(tool_response_msgs) > 0.2:
+            print(f"⚠️  More than 20% of tool responses are timeouts ({timeout_msg_number}/{len(tool_response_msgs)}), marking episode as TIMEOUT termination.")
+            termination_reason = TerminationReason.TIMEOUT
 
         # Create episode
         episode = Episode()
@@ -387,6 +431,7 @@ class DeepResearchWorkflow(Workflow):
             "time_taken": result.get("time_taken", 0),
             # "prediction": prediction,
             # "score_metrics": score_metrics,
+            "valid_submission": reward_details['valid_submission'],
             "reward": reward_value,
             "error_count": error_count,
             "error_rate": error_rate,

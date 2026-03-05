@@ -4,7 +4,7 @@ from pathlib import Path
 
 from rllm.data.dataset import DatasetRegistry
 
-from custom_evaluate import task_specific_prompt, user_prompt_template, load_task_description
+from .custom_evaluate import task_specific_prompt, user_prompt_template, load_task_description
 
 
 def build_rows(competition_ids: list[str], data_root: Path) -> list[dict]:

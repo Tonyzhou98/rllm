@@ -134,7 +134,7 @@ async def run(req: RunRequest = Body(..., example={"script_path": "/path/to/main
         "--gres=gpu:1",
         "--ntasks=1",
         "--cpus-per-task=64",
-        "--mem=32G",
+        "--mem=100G",
         "--time=2-00:00:00",
         f"--job-name={req.job_name or 'deepresearch_api_job'}",
         "bash",
