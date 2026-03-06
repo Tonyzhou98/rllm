@@ -50,8 +50,8 @@ train_tp=4
 train_pp=8
 train_ep=2
 train_etp=1
-max_prompt_len=4096
-max_response_len=16384
+max_prompt_len=8192
+max_response_len=32768
 total_seq_len=$((max_prompt_len + max_response_len))
 optimizer_offload_fraction=1.0
 # For PP=8 on a 94-layer model:
@@ -119,7 +119,7 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
     python3 -m examples.deepresearch.custom_train_megatron \
       algorithm.adv_estimator=grpo \
       data.train_batch_size=2 \
-      data.val_batch_size=64 \
+      data.val_batch_size=4 \
       data.max_prompt_length=$max_prompt_len \
       data.max_response_length=$max_response_len \
       data.train_files=$DATA_PATH/mle_bench_syn/train.parquet \
