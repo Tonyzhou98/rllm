@@ -1,11 +1,11 @@
 #!/bin/bash
 
 #SBATCH --chdir=/fsx/zyhang/rllm/
-#SBATCH --nodes 8
+#SBATCH --nodes 16
 #SBATCH --tasks-per-node 8
 #SBATCH --cpus-per-task 24
 #SBATCH --gpus-per-node 8
-#SBATCH --mem 1500G
+#SBATCH --mem 1800G
 #SBATCH --time=96:00:00
 #SBATCH --job-name=mle_syn_qwen3_235b_megatron_rl_grpo_agent_multi_nodes
 #SBATCH --output=/fsx/zyhang/rllm/examples/deepresearch/slurm/mle_syn_qwen3_235b_megatron_rl_grpo_agent_multi_nodes.stdout
@@ -118,8 +118,8 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
 
     python3 -m examples.deepresearch.custom_train_megatron \
       algorithm.adv_estimator=grpo \
-      data.train_batch_size=2 \
-      data.val_batch_size=4 \
+      data.train_batch_size=8 \
+      data.val_batch_size=16 \
       data.max_prompt_length=$max_prompt_len \
       data.max_response_length=$max_response_len \
       data.train_files=$DATA_PATH/mle_bench_syn/train.parquet \
@@ -134,7 +134,7 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
       actor_rollout_ref.model.use_remove_padding=True \
       actor_rollout_ref.model.use_fused_kernels=True \
       actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
-      actor_rollout_ref.actor.ppo_mini_batch_size=2 \
+      actor_rollout_ref.actor.ppo_mini_batch_size=4 \
       actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
       actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$total_seq_len \
       actor_rollout_ref.actor.use_dynamic_bsz=True \
@@ -174,7 +174,7 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
       actor_rollout_ref.rollout.enable_prefix_caching=True \
       actor_rollout_ref.rollout.temperature=1.0 \
       actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-      actor_rollout_ref.rollout.n=2 \
+      actor_rollout_ref.rollout.n=4 \
       actor_rollout_ref.rollout.val_kwargs.n=1 \
       actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
       actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
@@ -206,11 +206,11 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
       trainer.default_local_dir=$CHECKPOINT_PATH/${project_name}/${experiment_name} \
       trainer.n_gpus_per_node=8 \
       trainer.nnodes=$SLURM_JOB_NUM_NODES \
-      trainer.save_freq=5 \
-      trainer.test_freq=5 \
+      trainer.save_freq=20 \
+      trainer.test_freq=20 \
       trainer.default_hdfs_dir=null \
       rllm.workflow.use_workflow=True \
-      rllm.workflow.n_parallel_tasks=4 \
+      rllm.workflow.n_parallel_tasks=32 \
       rllm.stepwise_advantage.enable=False \
       rllm.stepwise_advantage.mode=broadcast \
       rllm.stepwise_advantage.normalize_by_steps=False \
